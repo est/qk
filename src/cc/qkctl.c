@@ -512,8 +512,11 @@ static int cmd_load(const char *object, const char *pin_dir, char **names,
 				    "list of congestion control algorithms is "
 				    "global, so it cannot be replaced until the "
 				    "machine reboots");
-			printf("this controller is already registered in this "
-			       "kernel; continuing\n");
+			printf("warning: the name is already registered in this "
+			       "kernel. The kernel does not allow a registered name "
+			       "to be replaced, so this may be a different build; "
+			   "the machine has to be rebooted for a new one to take "
+			   "effect. Continuing.\n");
 			return 0;
 		}
 		die("cannot register the congestion controller: %s",
