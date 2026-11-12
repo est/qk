@@ -60,10 +60,11 @@ struct qk_state {
 	/* diagnostics */
 	__u32 calls;
 	__u32 pad;
-	/* the controller's own delivery-rate measurement: the cumulative
-	 * delivered-byte counter and the time it was last read */
-	__u64 last_delivered_bytes;
-	__u64 last_measure_ns;
+	/* the retransmission counter at the end of the last round, so that the
+	 * number of segments lost during a round can be counted on kernels
+	 * whose congestion-control interface has no rate sample */
+	__u32 last_total_retrans;
+	__u32 last_total_retrans_pad;
 
 	/* the last rate sample, as the kernel reported it */
 	__s32 last_delivered;

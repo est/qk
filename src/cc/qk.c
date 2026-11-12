@@ -58,6 +58,26 @@
 #define QK_CC_NAME qk
 #endif
 
+/*
+ * The shape of the kernel's congestion-control interface changed between
+ * kernel versions:
+ *
+ *   QK_ABI_ARGS == 4   void (*cong_control)(struct sock *sk, u32 ack,
+ *                        int flag, const struct rate_sample *rs);
+ *   QK_ABI_ARGS == 2   void (*cong_control)(struct sock *sk,
+ *                        const struct ack_sample *sample);
+ *
+ * The four-argument form hands the controller a rate sample with the
+ * delivery rate and the loss counts. The two-argument form does not, so the
+ * erasure estimate is taken from the socket's own counters instead. The
+ * control law is otherwise identical.
+ *
+ * qk_abi(1) reports which one the running kernel expects; the build uses it.
+ */
+#ifndef QK_ABI_ARGS
+#define QK_ABI_ARGS 4
+#endif
+
 /* Turn the token into the string the kernel's operations table needs. */
 #define QK_STR_(x) #x
 #define QK_STR(x) QK_STR_(x)
@@ -96,6 +116,7 @@ struct tcp_sock {
 	__u32 delivered;
 	__u32 delivered_ce;
 	__u64 bytes_acked;
+	__u32 total_retrans;
 	__u32 snd_cwnd;
 	__u32 snd_ssthresh;
 	__u32 snd_cwnd_cnt;
@@ -320,17 +341,18 @@ int BPF_PROG(qk_pkts_acked, struct tcp_sock *tp, const struct ack_sample *sample
 /*
  * The control law. Runs once per acknowledged round.
  */
-SEC("struct_ops/qk_cong_control")
-int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
-	     const struct rate_sample *rs)
+/*
+ * One round of the control law.
+ *
+ * The three inputs are the round-trip time in microseconds, the number of
+ * packets lost during the round, and the number that arrived. Where they come
+ * from depends on the kernel's interface; see QK_ABI_ARGS.
+ */
+static void qk_step(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 acked)
 {
-	(void)ack;
-	(void)flag;
 	struct qk_state *st = qk_get(tp);
 	struct qk_tunables tun;
-	__u32 lost, acked, round_ppm, comp;
-	__u32 bound_us, factor_pct, cwnd, mss;
-
+	__u32 round_ppm, comp, bound_us, factor_pct, cwnd, mss;
 
 	if (!st) {
 		/* The state can legitimately be missing - the map is an LRU, and
@@ -343,29 +365,24 @@ int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
 		qk_put(tp, &fresh);
 		st = qk_get(tp);
 	}
-	if (!st || !rs)
-		return 0;
+	if (!st)
+		return;
 	st->calls++;
 
 	qk_load_tunables(&tun);
 	mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
 
 	/* --- 1. round-trip time: the floor and a smoothed value ----------
-	 * The round-trip time comes from the rate sample. The third argument
-	 * of this callback is the ACK flag word, not a time.
-	 *
 	 * The floor is a minimum, and a minimum is fragile: one spuriously
 	 * small sample pins it, and then the delay bound - which is derived
 	 * from the floor - is far below the real round-trip time, so the brake
 	 * is on all the time and the flow crawls. The floor therefore creeps
 	 * back up towards the smoothed value, slowly enough that a genuine
 	 * improvement still registers quickly. */
-	if (rs->rtt_us > 0) {
-		__u32 rtt = (__u32)rs->rtt_us;
-
-		if (st->min_rtt_us == 0 || rtt < st->min_rtt_us)
-			st->min_rtt_us = rtt;
-		st->smoothed_rtt_us = (st->smoothed_rtt_us * 3 + rtt) / 4;
+	if (rtt_us > 0) {
+		if (st->min_rtt_us == 0 || rtt_us < st->min_rtt_us)
+			st->min_rtt_us = rtt_us;
+		st->smoothed_rtt_us = (st->smoothed_rtt_us * 3 + rtt_us) / 4;
 	}
 
 	/* The kernel calls this once per acknowledged segment, but the delay
@@ -384,27 +401,10 @@ int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
 		}
 	}
 
-	/* Record what the kernel last reported, so that the loader can show
-	 * it: the rate sample's units differ between kernels, and seeing the
-	 * raw values is the only way to tell what the controller is looking
-	 * at. */
-	st->last_delivered = rs->delivered;
-	st->last_interval_us = (__s32)rs->interval_us;
-	st->last_rtt_us = (__s32)rs->rtt_us;
-	st->last_app_limited = rs->is_app_limited;
-	st->last_losses = rs->losses;
-	st->last_acked = rs->acked_sacked;
-	st->last_new_round = st->new_round;
-	st->last_cwnd = tp->snd_cwnd;
-
 	/* --- 2. the erasure estimate --------------------------------------
-	 * rate_sample.losses counts the packets lost during the interval and
-	 * acked_sacked the ones that arrived. The ratio is the channel's loss
-	 * rate. The floor is the lowest ratio seen recently: below it, loss is
-	 * independent of what we do, and only the excess above it can be
-	 * something we caused. */
-	lost = rs->losses > 0 ? (__u32)rs->losses : 0;
-	acked = rs->acked_sacked;
+	 * The loss ratio is the channel's loss rate. The floor is the lowest
+	 * ratio seen recently: below it, loss is independent of what we do,
+	 * and only the excess above it can be something we caused. */
 	st->win_lost += lost;
 	st->win_total += lost + acked;
 
@@ -501,12 +501,82 @@ int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
 			pacing = 1000;
 		((struct sock *)tp)->sk_pacing_rate = pacing;
 	}
+}
 
-	st->prior_cwnd = tp->snd_cwnd;
-	tp->snd_cwnd = cwnd;
-	tp->snd_cwnd_cnt = cwnd;
+#if QK_ABI_ARGS >= 4
+
+SEC("struct_ops/qk_cong_control")
+int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
+	     const struct rate_sample *rs)
+{
+	(void)ack;
+	(void)flag;
+
+	if (!rs)
+		return 0;
+
+	/* Record what the kernel last reported, so that the loader can show
+	 * it: the rate sample's units differ between kernels, and seeing the
+	 * raw values is the only way to tell what the controller is looking
+	 * at. */
+	{
+		struct qk_state *st = qk_get(tp);
+
+		if (st) {
+			st->last_delivered = rs->delivered;
+			st->last_interval_us = (__s32)rs->interval_us;
+			st->last_rtt_us = (__s32)rs->rtt_us;
+			st->last_app_limited = rs->is_app_limited;
+			st->last_losses = rs->losses;
+			st->last_acked = rs->acked_sacked;
+			st->last_new_round = st->new_round;
+			st->last_cwnd = tp->snd_cwnd;
+		}
+	}
+
+	qk_step(tp, rs->rtt_us > 0 ? (__u32)rs->rtt_us : 0,
+		rs->losses > 0 ? (__u32)rs->losses : 0, rs->acked_sacked);
 	return 0;
 }
+
+#else /* QK_ABI_ARGS == 2 */
+
+SEC("struct_ops/qk_cong_control")
+int BPF_PROG(qk_cong_control, struct tcp_sock *tp, const struct ack_sample *sample)
+{
+	struct qk_state *st;
+	struct qk_tunables tun;
+	__u32 lost = 0, acked, mss;
+
+	if (!sample)
+		return 0;
+
+	qk_load_tunables(&tun);
+	mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
+
+	st = qk_get(tp);
+	if (st) {
+		st->last_rtt_us = sample->rtt_us;
+		st->last_cwnd = tp->snd_cwnd;
+	}
+
+	/* This kernel's interface has no rate sample, so the erasure estimate
+	 * comes from the socket's own counters: the number of segments
+	 * retransmitted, against the number that were acknowledged. */
+	if (st && tp->total_retrans > st->last_total_retrans)
+		lost = tp->total_retrans - st->last_total_retrans;
+	acked = (__u32)(tp->bytes_acked / mss);
+
+	qk_step(tp, sample->rtt_us > 0 ? (__u32)sample->rtt_us : 0, lost, acked);
+
+	/* Remember the counters for the next round. */
+	st = qk_get(tp);
+	if (st)
+		st->last_total_retrans = tp->total_retrans;
+	return 0;
+}
+
+#endif /* QK_ABI_ARGS */
 
 /* ------------------------------------------------------------------ *
  * The congestion control operations table.
