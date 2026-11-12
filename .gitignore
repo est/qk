@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Ignore rules.
+#
+# Two directories in the working tree are deliberately *not* part of this
+# repository:
+#
+#   queqiao/  a pristine checkout of the upstream project, kept around as a
+#             reference.  It is a git repository of its own, so committing it
+#             would create an embedded repository inside this one.
+#   .tmp/     scratch space: experiment code, build artefacts, a vendored
+#             libbpf tarball and extracted kernel sources.  Large, and it
+#             contains third party source that does not belong here.
+#
+# Everything that is generated (build output, object files, editor and OS
+# noise) is excluded as well.  Documentation under docs/ is tracked.
+
+# --- reference checkout of the upstream project -------------------------
+/queqiao/
+
+# --- scratch space ------------------------------------------------------
+/.tmp/
+
+# --- build output -------------------------------------------------------
+build/
+_build/
+out/
+*.o
+*.so
+*.so.*
+*.a
+*.la
+*.lo
+*.bpf.o
+*.o.d
+*.d
+*.elf
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+
+# --- generated files ----------------------------------------------------
+/src/cc/build/
+/src/bench/build/
+/src/tools/build/
+vmlinux.h
+*.bpf.c
+*.skel.h
+
+# --- coverage / profiling ----------------------------------------------
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+# --- logs and local state ----------------------------------------------
+*.log
+*.pid
+*.sock
+.cache/
+/.cache/
+
+# --- editor and OS noise ------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*.swn
+*~
+*.bak
+*.orig
+*.rej
+.idea/
+.vscode/
+*.iml
+.project
+.cproject
+.settings/
+
+# --- credentials and local overrides -----------------------------------
+*.pem
+*.key
+*.crt
+.env
+.env.*
+secrets.*

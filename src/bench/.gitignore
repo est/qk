@@ -1,0 +1,3 @@
+# Build output of this directory.
+/tcperf
+*.o
