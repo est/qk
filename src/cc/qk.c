@@ -78,6 +78,22 @@
 #define QK_ABI_ARGS 4
 #endif
 
+/*
+ * Whether the controller writes the socket's pacing rate.
+ *
+ * The kernel allows a congestion control to write a short list of fields,
+ * and which fields are on that list changed between kernel versions: some
+ * kernels do not let a BPF congestion control write sk_pacing_rate at all.
+ * Where it cannot, the controller drives the window only - and since a
+ * congestion control in cong_control mode owns the pacing rate anyway, a
+ * socket whose pacing rate was never set is unpaced, which leaves the
+ * window as the only limit on the rate. That is a workable fallback, but it
+ * is a coarser one, so the default is to write the rate where allowed.
+ */
+#ifndef QK_SET_PACING
+#define QK_SET_PACING 1
+#endif
+
 /* Turn the token into the string the kernel's operations table needs. */
 #define QK_STR_(x) #x
 #define QK_STR(x) QK_STR_(x)
@@ -493,6 +509,7 @@ static void qk_step(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 acked)
 	}
 	cwnd = qk_clamp(cwnd, tun.min_cwnd, tun.max_cwnd);
 
+#if QK_SET_PACING
 	/* The rate follows the window: one round trip's worth of it. */
 	{
 		__u64 pacing = (__u64)cwnd * mss * 1000000ULL / st->min_rtt_us;
@@ -501,6 +518,7 @@ static void qk_step(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 acked)
 			pacing = 1000;
 		((struct sock *)tp)->sk_pacing_rate = pacing;
 	}
+#endif
 }
 
 #if QK_ABI_ARGS >= 4
