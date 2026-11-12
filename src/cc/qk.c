@@ -133,6 +133,7 @@ struct tcp_sock {
 	__u32 delivered_ce;
 	__u64 bytes_acked;
 	__u32 total_retrans;
+	__u32 srtt_us;
 	__u32 snd_cwnd;
 	__u32 snd_ssthresh;
 	__u32 snd_cwnd_cnt;
@@ -521,6 +522,55 @@ static void qk_step(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 acked)
 #endif
 }
 
+/*
+ * The additive-increase callback.
+ *
+ * Kernels before the congestion-control interface grew a cong_control
+ * callback insist on this one being present, and reject the registration
+ * otherwise. On kernels that do have cong_control it is never called:
+ * the kernel prefers cong_control and returns before reaching it.
+ *
+ * It runs the same control law, so a kernel without cong_control still gets
+ * a working controller - at the cost of not owning the pacing rate, because
+ * the kernel computes it from the window in that mode.
+ */
+SEC("struct_ops/qk_cong_avoid")
+int BPF_PROG(qk_cong_avoid, struct tcp_sock *tp, __u32 ack, __u32 acked)
+{
+	struct qk_state *st;
+	struct qk_tunables tun;
+	__u32 lost = 0, segments, mss;
+
+	(void)ack;
+	(void)acked;
+
+	qk_load_tunables(&tun);
+	mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
+
+	st = qk_get(tp);
+	if (!st) {
+		struct qk_state fresh = {};
+
+		fresh.comp_ppm = QK_PPM;
+		fresh.in_probe = 1;
+		qk_put(tp, &fresh);
+		st = qk_get(tp);
+	}
+	if (!st)
+		return 0;
+
+	if (tp->total_retrans > st->last_total_retrans)
+		lost = tp->total_retrans - st->last_total_retrans;
+	segments = (__u32)(tp->bytes_acked / mss);
+
+	qk_step(tp, tp->srtt_us, lost, segments);
+
+	st = qk_get(tp);
+	if (st)
+		st->last_total_retrans = tp->total_retrans;
+	return 0;
+}
+
 #if QK_ABI_ARGS >= 4
 
 SEC("struct_ops/qk_cong_control")
@@ -615,6 +665,7 @@ struct tcp_congestion_ops {
 	__u32 (*undo_cwnd)(struct tcp_sock *tp);
 	void (*cong_control)(struct tcp_sock *tp, __u32 ack, __s32 rtt_us,
 			     const struct rate_sample *rs);
+	void (*cong_avoid)(struct tcp_sock *tp, __u32 ack, __u32 acked);
 	void (*pkts_acked)(struct tcp_sock *tp, const struct ack_sample *sample);
 	char name[16];
 };
@@ -629,6 +680,7 @@ struct tcp_congestion_ops qk = {
 	.sndbuf_expand = (void *)qk_sndbuf_expand,
 	.undo_cwnd = (void *)qk_undo_cwnd,
 	.cong_control = (void *)qk_cong_control,
+	.cong_avoid = (void *)qk_cong_avoid,
 	.pkts_acked = (void *)qk_pkts_acked,
 	.name = QK_STR(QK_CC_NAME),
 };
