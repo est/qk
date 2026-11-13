@@ -33,15 +33,10 @@ CTL       := $(BUILD_DIR)/qkctl
 
 # The BPF target architecture: x86_64 -> x86, aarch64 -> arm64, and so on.
 UNAME_M := $(shell uname -m)
-ARCH ?= $(shell case "$(UNAME_M)" in \
-	x86_64) echo x86 ;; \
-	aarch64|arm64) echo arm64 ;; \
-	armv7l|armv7) echo arm ;; \
-	ppc64le) echo powerpc ;; \
-	s390x) echo s390 ;; \
-	riscv64) echo riscv ;; \
-	*) echo "" ;; \
-	esac)
+# The case statement has to stay on one line: make folds the backslash
+# continuations of a $(shell ...) into spaces before the shell sees them,
+# which would break the case.
+ARCH ?= $(shell case "$(UNAME_M)" in x86_64) echo x86 ;; aarch64|arm64) echo arm64 ;; armv7l|armv7) echo arm ;; ppc64le) echo powerpc ;; s390x) echo s390 ;; riscv64) echo riscv ;; *) echo "" ;; esac)
 
 ifeq ($(strip $(ARCH)),)
 $(error unsupported architecture '$(UNAME_M)'; set ARCH= explicitly)
