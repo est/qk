@@ -30,6 +30,7 @@ import time
 # headers (include/uapi/linux/tcp.h).
 TCP_CONGESTION = getattr(socket, "TCP_CONGESTION", 13)
 ENOPROTOOPT = getattr(errno, "ENOPROTOOPT", 92)
+EINVAL = getattr(errno, "EINVAL", 22)
 
 
 def select_cc(sock, name):
@@ -93,6 +94,10 @@ def main():
     except OSError as exc:
         raise SystemExit("rawtcp: cannot send the request: %s" % exc)
 
+    # A short read timeout keeps the loop honest about the deadline: a
+    # blocking recv would overrun it by however long the next chunk takes.
+    stream.settimeout(1.0)
+
     total = 0
     start = time.time()
     end = start + args.duration
@@ -100,7 +105,7 @@ def main():
         try:
             chunk = stream.recv(1 << 20)
         except socket.timeout:
-            break
+            continue
         except OSError:
             break
         if not chunk:
