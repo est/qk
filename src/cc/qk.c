@@ -94,6 +94,24 @@
 #define QK_SET_PACING 1
 #endif
 
+/*
+ * Whether the controller uses the cong_control callback.
+ *
+ * A controller that provides cong_control owns the socket's pacing rate, and
+ * that is the better arrangement: the rate is then exactly what the control
+ * law asks for. But the kernel's list of fields a congestion control may
+ * write changed between kernel versions, and some kernels do not include
+ * sk_pacing_rate at all - on those, a program that writes it is refused at
+ * load time.
+ *
+ * With QK_USE_CONG_CONTROL unset the controller works through the
+ * additive-increase callback instead, and lets the kernel compute the pacing
+ * rate from the window. That is coarser, but it works everywhere.
+ */
+#ifndef QK_USE_CONG_CONTROL
+#define QK_USE_CONG_CONTROL 1
+#endif
+
 /* Turn the token into the string the kernel's operations table needs. */
 #define QK_STR_(x) #x
 #define QK_STR(x) QK_STR_(x)
@@ -371,8 +389,7 @@ static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 ac
 {
 	struct qk_state *st = qk_get(tp);
 	struct qk_tunables tun;
-	__u32 round_ppm, comp, bound_us, factor_pct, cwnd, mss;
-
+	__u32 round_ppm, comp, bound_us, factor_pct, cwnd;
 	if (!st) {
 		/* The state can legitimately be missing - the map is an LRU, and
 		 * a long-lived map can evict an idle connection. Recreating it
@@ -389,7 +406,6 @@ static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 ac
 	st->calls++;
 
 	qk_load_tunables(&tun);
-	mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
 
 	/* --- 1. round-trip time: the floor and a smoothed value ----------
 	 * The floor is a minimum, and a minimum is fragile: one spuriously
@@ -512,9 +528,10 @@ static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 ac
 	}
 	cwnd = qk_clamp(cwnd, tun.min_cwnd, tun.max_cwnd);
 
-#if QK_SET_PACING
+#if QK_USE_CONG_CONTROL && QK_SET_PACING
 	/* The rate follows the window: one round trip's worth of it. */
 	{
+		__u32 mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
 		__u64 pacing = (__u64)cwnd * mss * 1000000ULL / st->min_rtt_us;
 
 		if (pacing < 1000)
@@ -541,13 +558,12 @@ int BPF_PROG(qk_cong_avoid, struct tcp_sock *tp, __u32 ack, __u32 acked)
 {
 	struct qk_state *st;
 	struct qk_tunables tun;
-	__u32 lost = 0, segments, mss;
+	__u32 lost = 0, segments;
 
 	(void)ack;
 	(void)acked;
 
 	qk_load_tunables(&tun);
-	mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
 
 	st = qk_get(tp);
 	if (!st) {
@@ -563,7 +579,7 @@ int BPF_PROG(qk_cong_avoid, struct tcp_sock *tp, __u32 ack, __u32 acked)
 
 	if (tp->total_retrans > st->last_total_retrans)
 		lost = tp->total_retrans - st->last_total_retrans;
-	segments = (__u32)(tp->bytes_acked / mss);
+	segments = (__u32)(tp->bytes_acked / (tun.mss ? tun.mss : QK_DEFAULT_MSS));
 
 	/* Without a rate sample the round-trip time comes from the socket's
 	 * own smoothed estimate. */
@@ -575,6 +591,7 @@ int BPF_PROG(qk_cong_avoid, struct tcp_sock *tp, __u32 ack, __u32 acked)
 	return 0;
 }
 
+#if QK_USE_CONG_CONTROL
 /* The law, driven by the rate sample the kernel hands over. */
 static void qk_step(struct tcp_sock *tp, const struct rate_sample *rs)
 {
@@ -586,12 +603,14 @@ static void qk_step(struct tcp_sock *tp, const struct rate_sample *rs)
 	acked = rs->acked_sacked;
 	qk_step_loss(tp, rs->rtt_us > 0 ? (__u32)rs->rtt_us : 0, lost, acked);
 }
+#endif /* QK_USE_CONG_CONTROL */
 
 /*
  * Record what the kernel last reported, so that the loader can show it: the
  * rate sample's units differ between kernels, and seeing the raw values is
  * the only way to tell what the controller is looking at.
  */
+#if QK_USE_CONG_CONTROL
 static void qk_record_sample(struct tcp_sock *tp, const struct rate_sample *rs)
 {
 	struct qk_state *st = qk_get(tp);
@@ -607,8 +626,9 @@ static void qk_record_sample(struct tcp_sock *tp, const struct rate_sample *rs)
 	st->last_new_round = st->new_round;
 	st->last_cwnd = tp->snd_cwnd;
 }
+#endif /* QK_USE_CONG_CONTROL */
 
-#if QK_ABI_ARGS >= 4
+#if QK_USE_CONG_CONTROL && QK_ABI_ARGS >= 4
 
 SEC("struct_ops/qk_cong_control")
 int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
@@ -622,7 +642,7 @@ int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
 	return 0;
 }
 
-#else /* QK_ABI_ARGS == 2 */
+#elif QK_USE_CONG_CONTROL /* QK_ABI_ARGS == 2 */
 
 SEC("struct_ops/qk_cong_control")
 int BPF_PROG(qk_cong_control, struct tcp_sock *tp, const struct rate_sample *rs)
@@ -632,7 +652,7 @@ int BPF_PROG(qk_cong_control, struct tcp_sock *tp, const struct rate_sample *rs)
 	return 0;
 }
 
-#endif /* QK_ABI_ARGS */
+#endif /* QK_USE_CONG_CONTROL */
 
 /* ------------------------------------------------------------------ *
  * The congestion control operations table.
@@ -651,8 +671,10 @@ struct tcp_congestion_ops {
 	__u32 (*min_tso_segs)(struct tcp_sock *tp);
 	__u32 (*sndbuf_expand)(struct tcp_sock *tp);
 	__u32 (*undo_cwnd)(struct tcp_sock *tp);
+#if QK_USE_CONG_CONTROL
 	void (*cong_control)(struct tcp_sock *tp, __u32 ack, __s32 rtt_us,
 			     const struct rate_sample *rs);
+#endif
 	void (*cong_avoid)(struct tcp_sock *tp, __u32 ack, __u32 acked);
 	void (*pkts_acked)(struct tcp_sock *tp, const struct ack_sample *sample);
 	char name[16];
@@ -667,7 +689,9 @@ struct tcp_congestion_ops qk = {
 	.min_tso_segs = (void *)qk_min_tso_segs,
 	.sndbuf_expand = (void *)qk_sndbuf_expand,
 	.undo_cwnd = (void *)qk_undo_cwnd,
+#if QK_USE_CONG_CONTROL
 	.cong_control = (void *)qk_cong_control,
+#endif
 	.cong_avoid = (void *)qk_cong_avoid,
 	.pkts_acked = (void *)qk_pkts_acked,
 	.name = QK_STR(QK_CC_NAME),

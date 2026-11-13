@@ -464,8 +464,8 @@ static int cmd_unload(const char *pin_dir)
 	return 0;
 }
 
-static int cmd_load(const char *object, const char *pin_dir, char **names,
-		    uint32_t *values, int n, int daemon, int strict)
+static int cmd_load(const char *object, const char *fallback, const char *pin_dir,
+		    char **names, uint32_t *values, int n, int daemon, int strict)
 {
 	struct bpf_map *ops_map, *tun_map, *states_map = NULL;
 	char *before = NULL, *reg_name = NULL;
@@ -476,8 +476,24 @@ static int cmd_load(const char *object, const char *pin_dir, char **names,
 	g_obj = bpf_object__open_file(object, NULL);
 	if (!g_obj)
 		die("cannot open %s", object);
-	if (bpf_object__load(g_obj) < 0)
-		die("cannot load %s", object);
+	if (bpf_object__load(g_obj) < 0) {
+		/* Some kernels refuse a congestion control that writes the
+		 * socket's pacing rate, because their list of writable fields
+		 * does not include it. The fallback object is the same controller
+		 * working through the additive-increase callback, where the
+		 * kernel computes the pacing rate from the window. */
+		if (!fallback) {
+			die("cannot load %s", object);
+		}
+		fprintf(stderr, "qkctl: %s did not load; trying %s\n", object, fallback);
+		bpf_object__close(g_obj);
+		g_obj = bpf_object__open_file(fallback, NULL);
+		if (!g_obj)
+			die("cannot open %s", fallback);
+		if (bpf_object__load(g_obj) < 0)
+			die("cannot load %s", fallback);
+		object = fallback;
+	}
 
 	tun_map = find_map(g_obj, QK_TUNABLES_MAP, BPF_MAP_TYPE_ARRAY, 0);
 	if (!tun_map)
@@ -634,6 +650,7 @@ static void usage(FILE *out)
 		"\n"
 		"options:\n"
 		"  --object FILE     BPF object to load (default %s)\n"
+		"  --fallback FILE   object to try if the first one is refused\n"
 		"  --set KEY=VALUE   set a tunable; repeatable\n"
 		"  --pin-dir DIR     directory for the pinned maps (default %s,\n"
 		"                    \"none\" to disable pinning)\n"
@@ -647,9 +664,10 @@ static void usage(FILE *out)
 int main(int argc, char **argv)
 {
 	enum { OPT_OBJECT = 1000, OPT_SET, OPT_PIN_DIR, OPT_DAEMON, OPT_STRICT,
-	       OPT_STATE_DIR };
+	       OPT_STATE_DIR, OPT_FALLBACK };
 	static const struct option opts[] = {
 		{ "object", required_argument, NULL, OPT_OBJECT },
+		{ "fallback", required_argument, NULL, OPT_FALLBACK },
 		{ "set", required_argument, NULL, OPT_SET },
 		{ "pin-dir", required_argument, NULL, OPT_PIN_DIR },
 		{ "daemon", no_argument, NULL, OPT_DAEMON },
@@ -659,6 +677,7 @@ int main(int argc, char **argv)
 		{ 0, 0, 0, 0 },
 	};
 	const char *object = QK_DEFAULT_OBJECT;
+	const char *fallback = NULL;
 	const char *pin_dir = QK_DEFAULT_PIN_DIR;
 	char *names[64];
 	uint32_t values[64];
@@ -677,6 +696,9 @@ int main(int argc, char **argv)
 		switch (opt) {
 		case OPT_OBJECT:
 			object = optarg;
+			break;
+		case OPT_FALLBACK:
+			fallback = optarg;
 			break;
 		case OPT_PIN_DIR:
 			pin_dir = optarg;
@@ -713,7 +735,7 @@ int main(int argc, char **argv)
 	}
 
 	if (!strcmp(argv[optind], "load"))
-		return cmd_load(object, pin_dir, names, values, n, daemon, strict);
+		return cmd_load(object, fallback, pin_dir, names, values, n, daemon, strict);
 	if (!strcmp(argv[optind], "tune"))
 		return cmd_tune(pin_dir, names, values, n);
 	if (!strcmp(argv[optind], "list"))

@@ -27,6 +27,7 @@ IMAGE     ?= public.ecr.aws/docker/library/ubuntu:24.04
 SRC_DIR   := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR := $(SRC_DIR)build
 OBJ       := $(BUILD_DIR)/qk.o
+AVOID_OBJ := $(BUILD_DIR)/qk_avoid.o
 ABI_TOOL  := $(BUILD_DIR)/qk_abi
 CTL       := $(BUILD_DIR)/qkctl
 
@@ -74,6 +75,8 @@ container:
 		abi=$$(/out/qk_abi 2>/dev/null || echo 4); \
 		echo "kernel congestion-control interface: $$abi arguments"; \
 		clang $(BPF_CFLAGS) -DQK_ABI_ARGS=$$abi -c /src/qk.c -o /out/qk.o; \
+		clang $(BPF_CFLAGS) -DQK_ABI_ARGS=$$abi -DQK_USE_CONG_CONTROL=0 \
+			-c /src/qk.c -o /out/qk_avoid.o; \
 		cc $(HOST_CFLAGS) /src/qkctl.c -o /out/qkctl -lbpf -lelf -lz; \
 	'
 	@echo "built $(OBJ) and $(CTL)"
@@ -83,7 +86,9 @@ native:
 	cc $(HOST_CFLAGS) $(SRC_DIR)qk_abi.c -o $(ABI_TOOL) -lbpf -lelf -lz
 	@abi=$$($(ABI_TOOL) 2>/dev/null || echo $(ABI_ARGS)); \
 	echo "kernel congestion-control interface: $$abi arguments"; \
-	clang $(BPF_CFLAGS) -DQK_ABI_ARGS=$$abi -c $(SRC_DIR)qk.c -o $(OBJ)
+	clang $(BPF_CFLAGS) -DQK_ABI_ARGS=$$abi -c $(SRC_DIR)qk.c -o $(OBJ); \
+	clang $(BPF_CFLAGS) -DQK_ABI_ARGS=$$abi -DQK_USE_CONG_CONTROL=0 \
+		-c $(SRC_DIR)qk.c -o $(AVOID_OBJ)
 	cc $(HOST_CFLAGS) $(SRC_DIR)qkctl.c -o $(CTL) -lbpf -lelf -lz
 
 clean:
