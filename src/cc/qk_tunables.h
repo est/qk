@@ -69,6 +69,14 @@
 /* Assumed segment size for the bandwidth-delay product, in bytes. */
 #define QK_DEFAULT_MSS 1460u
 
+/*
+ * Whether the pacing rate is derived from the measured delivery rate instead
+ * of from the window. 0 keeps the window-driven formula; 1 paces from the
+ * delivery-rate estimate (see qk.c), with the window kept loose so that it
+ * does not bind.
+ */
+#define QK_DEFAULT_BW_PACING 0u
+
 struct qk_tunables {
 	__u32 magic;
 	__u32 max_comp_ppm;
@@ -80,6 +88,10 @@ struct qk_tunables {
 	__u32 min_cwnd;
 	__u32 max_cwnd;
 	__u32 mss;
+	/* 0 = pace from window * mss / min_rtt (the original formula);
+	 * non-zero = pace from the measured delivery rate, and hold the
+	 * window at 2x BDP so that it does not bind */
+	__u32 bw_pacing;
 	__u32 reserved;
 };
 
@@ -103,8 +115,10 @@ struct qk_tunables {
 	{ "max_cwnd", QK_DEFAULT_MAX_CWND, \
 	  offsetof(struct qk_tunables, max_cwnd) }, \
 	{ "mss", QK_DEFAULT_MSS, \
-	  offsetof(struct qk_tunables, mss) }
+	  offsetof(struct qk_tunables, mss) }, \
+	{ "bw_pacing", QK_DEFAULT_BW_PACING, \
+	  offsetof(struct qk_tunables, bw_pacing) }
 
-#define QK_TUNABLE_COUNT 9
+#define QK_TUNABLE_COUNT 10
 
 #endif /* QK_TUNABLES_H */

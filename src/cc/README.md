@@ -112,6 +112,7 @@ the controller is running.
 | `min_cwnd` | 10 | window floor, in packets |
 | `max_cwnd` | 10000 | window ceiling, in packets |
 | `mss` | 1460 | assumed segment size, in bytes |
+| `bw_pacing` | 0 | 0 = pace from `window * mss / min_rtt`; 1 = pace from the measured delivery rate, with the window held at 2× BDP so it does not bind |
 
 ## What the kernel allows
 
@@ -128,5 +129,18 @@ tcp_sock.snd_ssthresh        tcp_sock.ecn_flags        tcp_sock.app_limited
 Everything else is refused. That is enough for a congestion control, and it
 is also the reason the controller cannot repair the loss itself: the kernel's
 own recovery machinery — the proportional window reduction during fast
-recovery, and the window reset on a retransmission timeout — is not reachable
-from a congestion-control callback.
+recovery, and the window reset on a retransmission timeout — is performed by
+the kernel itself.
+
+Two details of that machinery matter here:
+
+- **The pacing rate is ignored unless the socket is flagged.** The kernel
+  only uses `sk_pacing_rate` when `sk_pacing_status` is `SK_PACING_NEEDED`
+  (1); a rate written without that flag has no effect and the sender bursts.
+  `qk` sets the flag when it initialises the connection, the way BBR does.
+- **The timeout window reset is followed by a callback.** `tcp_enter_loss()`
+  cuts the window to `packets_in_flight+1` and then calls the `set_state`
+  callback, so `qk` restores a sane window there instead of falling into the
+  `cwnd=1` death spiral — giving back only the minimum window when the delay
+  brake is already engaged. Likewise, the kernel keeps the pre-loss window in
+  `prior_cwnd` and hands it back through `undo_cwnd` on an FRTO/DSACK undo.

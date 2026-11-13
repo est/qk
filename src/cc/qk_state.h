@@ -75,6 +75,18 @@ struct qk_state {
 	__u32 last_acked;
 	__u32 last_new_round;
 	__u32 last_cwnd;
+
+	/* --- appended fields: the loader reads this struct by name from the
+	 * same header, so only appending is safe ------------------------ */
+
+	/* tp->bytes_acked at the start of the current round, the base of the
+	 * delivery-rate estimate (bytes, kernel-version stable) */
+	__u64 bw_prev_bytes;
+
+	/* diagnostics: how many times the window was restored on entering
+	 * TCP_CA_Loss */
+	__u32 loss_restores;
+	__u32 pad2;
 };
 
 #endif /* QK_STATE_H */

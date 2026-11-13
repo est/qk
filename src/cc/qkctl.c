@@ -233,6 +233,7 @@ static int apply_tunables(struct bpf_map *map, const uint32_t *overrides,
 	t.min_cwnd = QK_DEFAULT_MIN_CWND;
 	t.max_cwnd = QK_DEFAULT_MAX_CWND;
 	t.mss = QK_DEFAULT_MSS;
+	t.bw_pacing = QK_DEFAULT_BW_PACING;
 
 	for (size_t i = 0; i < TUNABLE_COUNT; i++) {
 		if (!override_names)
@@ -397,10 +398,12 @@ static int cmd_stats(const char *pin_dir)
 		if (bpf_map_lookup_elem(fd, &key, &st) < 0)
 			continue;
 		printf("sock=%llx bw=%llu min_rtt_us=%u smooth_rtt_us=%u "
-		       "floor_ppm=%u comp_ppm=%u calls=%u prior_cwnd=%u\n",
+		       "floor_ppm=%u comp_ppm=%u calls=%u prior_cwnd=%u "
+		       "loss_restores=%u\n",
 		       (unsigned long long)key, (unsigned long long)st.bw,
 		       st.min_rtt_us, st.smoothed_rtt_us, st.floor_ppm,
-		       st.comp_ppm, st.calls, st.prior_cwnd);
+		       st.comp_ppm, st.calls, st.prior_cwnd,
+		       st.loss_restores);
 		printf("  sample: delivered=%d interval_us=%d rtt_us=%d "
 		       "app_limited=%u losses=%u acked=%u new_round=%u cwnd=%u\n",
 		       st.last_delivered, st.last_interval_us, st.last_rtt_us,

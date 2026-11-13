@@ -156,6 +156,9 @@ struct tcp_sock {
 	__u32 snd_ssthresh;
 	__u32 snd_cwnd_cnt;
 	__u32 snd_cwnd_clamp;
+	/* cwnd right before starting loss recovery, saved by the kernel
+	 * before it cuts the window; the value undo_cwnd has to give back */
+	__u32 prior_cwnd;
 } __attribute__((preserve_access_index));
 
 /* The kernel's per-ACK sample. */
@@ -259,6 +262,7 @@ static __always_inline void qk_load_tunables(struct qk_tunables *out)
 	out->min_cwnd = QK_DEFAULT_MIN_CWND;
 	out->max_cwnd = QK_DEFAULT_MAX_CWND;
 	out->mss = QK_DEFAULT_MSS;
+	out->bw_pacing = QK_DEFAULT_BW_PACING;
 	out->reserved = 0;
 }
 
@@ -287,6 +291,15 @@ int BPF_PROG(qk_init, struct tcp_sock *tp)
 	 * ceiling it already had; only the rate itself is driven from here. */
 	tp->snd_cwnd = tun.min_cwnd;
 	tp->snd_cwnd_cnt = tun.min_cwnd;
+
+#if QK_USE_CONG_CONTROL && QK_SET_PACING
+	/* The kernel ignores sk_pacing_rate unless the socket is marked as
+	 * needing internal pacing: tcp_needs_internal_pacing() checks
+	 * sk_pacing_status == SK_PACING_NEEDED (1) before every use of the
+	 * rate, so a rate written without the flag has no effect and the
+	 * sender bursts. BBR sets the same flag in its init. */
+	((struct sock *)tp)->sk_pacing_status = 1;
+#endif
 	return 0;
 }
 
@@ -325,11 +338,71 @@ __u32 BPF_PROG(qk_ssthresh, struct tcp_sock *tp)
 	return qk_clamp(target, tun.min_cwnd, tun.max_cwnd);
 }
 
+/* The kernel's congestion states, from include/uapi/linux/tcp.h:
+ * Open=0, Disorder=1, CWR=2, Recovery=3, Loss=4. Declared locally because
+ * the uapi header is not part of this program's includes. */
+#define QK_TCP_CA_LOSS 4
+
+/* Called on every congestion-state transition; only the one into Loss
+ * matters here.
+ *
+ * tcp_enter_loss() saves the old window and then resets cwnd to
+ * packets_in_flight+1, and tcp_set_ca_state() invokes this callback right
+ * after that reset - so a write here sticks. Without the restore the flow
+ * falls into the documented death spiral: cwnd=1 means few ACKs, the
+ * controller is then almost never called, the window never grows back and
+ * the flow crawls at the erasure rate. On an erasure path a timeout is not
+ * congestion, so the window is put back.
+ *
+ * If the delay brake is already engaged the full window would just pour
+ * fuel into a queue that is too deep, so only the minimum window is
+ * restored: enough to keep ACKs - and with them RTT samples, controller
+ * callbacks, and the icsk_backoff reset - flowing.
+ */
 SEC("struct_ops/qk_set_state")
 int BPF_PROG(qk_set_state, struct tcp_sock *tp, __u8 new_state)
 {
-	(void)tp;
-	(void)new_state;
+	struct qk_state *st;
+	struct qk_tunables tun;
+	__u32 target;
+
+	if (new_state != QK_TCP_CA_LOSS)
+		return 0;
+
+	qk_load_tunables(&tun);
+
+	st = qk_get(tp);
+	if (!st) {
+		/* Same recreate-on-missing pattern as qk_step_loss: the map
+		 * is an LRU, so an idle connection can have been evicted.
+		 * Recreating it is better than giving up on the connection. */
+		struct qk_state fresh = {};
+
+		fresh.comp_ppm = QK_PPM;
+		fresh.probe_cwnd = tun.min_cwnd;
+		fresh.in_probe = 1;
+		qk_put(tp, &fresh);
+		st = qk_get(tp);
+	}
+	if (!st)
+		return 0;
+
+	/* The window the controller intends to be at, as the rest of the law
+	 * sizes it: the probe window scaled by the compensation. */
+	target = (__u32)(((__u64)st->probe_cwnd * st->comp_ppm) / QK_PPM);
+	target = qk_clamp(target, tun.min_cwnd, tun.max_cwnd);
+
+	/* The delay brake, evaluated the same way as in qk_step_loss. */
+	if (st->min_rtt_us && st->smoothed_rtt_us) {
+		__u64 bound_us = ((__u64)st->min_rtt_us * tun.brake_ratio_pct) / 100;
+
+		if (st->smoothed_rtt_us > bound_us)
+			target = tun.min_cwnd;
+	}
+
+	tp->snd_cwnd = target;
+	tp->snd_cwnd_cnt = target;
+	st->loss_restores++;
 	return 0;
 }
 
@@ -347,13 +420,20 @@ __u32 BPF_PROG(qk_sndbuf_expand, struct tcp_sock *tp)
 	return 0;
 }
 
-/* The kernel requires this callback; it returns the window to restore when
- * leaving fast recovery. */
+/* Called when the kernel undoes a window reduction (FRTO or DSACK).
+ *
+ * The kernel saved the pre-loss window in tp->prior_cwnd, and on an erasure
+ * path an undo has to give the full window back: nothing about the path has
+ * changed, so there is nothing to recover from. st->prior_cwnd is the
+ * controller's own copy of the same idea; older versions of this program
+ * never wrote it, so it is usually zero. */
 SEC("struct_ops/qk_undo_cwnd")
 __u32 BPF_PROG(qk_undo_cwnd, struct tcp_sock *tp)
 {
 	struct qk_state *st = qk_get(tp);
 
+	if (tp->prior_cwnd)
+		return tp->prior_cwnd;
 	if (st && st->prior_cwnd)
 		return st->prior_cwnd;
 	return tp->snd_cwnd;
@@ -389,7 +469,7 @@ static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 ac
 {
 	struct qk_state *st = qk_get(tp);
 	struct qk_tunables tun;
-	__u32 round_ppm, comp, bound_us, factor_pct, cwnd;
+	__u32 round_ppm, comp, bound_us = 0, factor_pct, cwnd;
 	if (!st) {
 		/* The state can legitimately be missing - the map is an LRU, and
 		 * a long-lived map can evict an idle connection. Recreating it
@@ -429,8 +509,52 @@ static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 ac
 
 		if (st->round_start_ns == 0 ||
 		    now - st->round_start_ns >= round_ns) {
+			/* --- the delivery-rate estimate -------------------
+			 * One sample per round: the bytes acknowledged since
+			 * the last round over the wall time of that round.
+			 * tp->bytes_acked is counted in bytes on every kernel
+			 * version, unlike the rate sample's delivered count,
+			 * whose units differ between kernels.
+			 *
+			 * A physically impossible sample is not a sample: an
+			 * elapsed time of zero would divide by nothing, and a
+			 * counter that went backwards would produce a delta
+			 * near 2^64. One such value would explode the
+			 * estimate, so both cases are ignored and only the
+			 * counter is re-seeded. */
+			if (st->round_start_ns && now > st->round_start_ns &&
+			    tp->bytes_acked >= st->bw_prev_bytes) {
+				__u64 delta = tp->bytes_acked - st->bw_prev_bytes;
+				__u64 sample = (delta * 1000000000ULL) /
+					       (now - st->round_start_ns);
+				__u64 decayed = (st->bw * tun.bw_decay_pct) / 100;
+
+				/* a maximum filter with decay: a round that
+				 * carried more than the last does not raise
+				 * the estimate forever, and a round that
+				 * carried less decays it towards the new
+				 * reality */
+				st->bw = sample > decayed ? sample : decayed;
+			}
+			st->bw_prev_bytes = tp->bytes_acked;
 			st->round_start_ns = now;
 			st->new_round = 1;
+
+			/* --- the minimum-RTT floor creeps up ---------------
+			 * A minimum that only ever falls is pinned forever by
+			 * one spuriously small sample: the delay bound is
+			 * derived from the floor, so the brake would stay on
+			 * below the real round-trip time and the flow would
+			 * crawl. The round length is derived from the floor
+			 * too, so a floor far below the real RTT also makes
+			 * rounds far too short. Creeping a sixteenth of the
+			 * way to the smoothed value per round recovers within
+			 * a few rounds, while a genuine improvement still
+			 * registers immediately because the minimum is still
+			 * taken on every sample. */
+			if (st->smoothed_rtt_us > st->min_rtt_us)
+				st->min_rtt_us += (st->smoothed_rtt_us -
+						   st->min_rtt_us) / 16;
 		} else {
 			st->new_round = 0;
 		}
@@ -483,9 +607,16 @@ static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 ac
 	 * This is the whole control law, and it needs no delivery-rate
 	 * estimate: on a path whose loss does not depend on the rate, the
 	 * round-trip time is the only signal that means anything. */
-	if (st->new_round && st->min_rtt_us && st->smoothed_rtt_us) {
+	/* The bound is needed on every call - the brake below reads it - so
+	 * it is computed whenever both round-trip estimates exist, while the
+	 * window it governs only moves once per round. It used to be
+	 * computed inside the new_round branch, which left every other call
+	 * reading a stale value; that was harmless while the pacing rate was
+	 * dead, and is not harmless now that the brake scales it. */
+	if (st->min_rtt_us && st->smoothed_rtt_us)
 		bound_us = st->min_rtt_us * tun.brake_ratio_pct / 100;
 
+	if (st->new_round && st->min_rtt_us && st->smoothed_rtt_us) {
 		if (bound_us && st->smoothed_rtt_us <= bound_us) {
 			st->probe_cwnd += st->probe_cwnd / 8;
 			if (st->probe_cwnd < 16)
@@ -526,16 +657,46 @@ static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 ac
 		if (reduced < tp->snd_cwnd)
 			cwnd = reduced;
 	}
+
+	/* When the pacing rate comes from the measured delivery rate, the
+	 * rate is the control variable and the window is only the result: it
+	 * must be loose enough not to bind, so it is held at twice the
+	 * bandwidth-delay product (the delay used is the minimum, which is
+	 * the pipe's real size) while the tunable bounds still apply. */
+	if (tun.bw_pacing && st->bw && st->min_rtt_us) {
+		__u32 mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
+		__u64 bdp = (st->bw * st->min_rtt_us) / 1000000ULL;
+		__u64 floor = (2 * bdp) / mss;
+
+		if (floor > cwnd)
+			cwnd = floor > tun.max_cwnd ? tun.max_cwnd : (__u32)floor;
+	}
 	cwnd = qk_clamp(cwnd, tun.min_cwnd, tun.max_cwnd);
 
 #if QK_USE_CONG_CONTROL && QK_SET_PACING
-	/* The rate follows the window: one round trip's worth of it. */
 	{
 		__u32 mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
-		__u64 pacing = (__u64)cwnd * mss * 1000000ULL / st->min_rtt_us;
+		__u64 pacing;
 
+		if (tun.bw_pacing && st->bw) {
+			/* Pace at what the path has been observed to deliver,
+			 * scaled by the compensation (the bytes that arrive
+			 * have to cover the bytes sent) and by the delay
+			 * brake. */
+			pacing = (st->bw * comp) / QK_PPM;
+			pacing = (pacing * factor_pct) / QK_PPM;
+		} else {
+			/* The rate follows the window: one round trip's worth
+			 * of it. */
+			pacing = (__u64)cwnd * mss * 1000000ULL / st->min_rtt_us;
+		}
 		if (pacing < 1000)
 			pacing = 1000;
+		/* The kernel ignores the rate unless the socket is flagged
+		 * SK_PACING_NEEDED (1); re-assert the flag here in case
+		 * something cleared it, since every rate written below is
+		 * dead without it (BBR does the same in its init). */
+		((struct sock *)tp)->sk_pacing_status = 1;
 		((struct sock *)tp)->sk_pacing_rate = pacing;
 	}
 #endif
@@ -582,8 +743,10 @@ int BPF_PROG(qk_cong_avoid, struct tcp_sock *tp, __u32 ack, __u32 acked)
 	segments = (__u32)(tp->bytes_acked / (tun.mss ? tun.mss : QK_DEFAULT_MSS));
 
 	/* Without a rate sample the round-trip time comes from the socket's
-	 * own smoothed estimate. */
-	qk_step_loss(tp, tp->srtt_us, lost, segments);
+	 * own smoothed estimate - but the kernel keeps that estimate scaled
+	 * by eight (tcp_rtt_estimator stores "smoothed RTT << 3 in usecs"),
+	 * so the shift has to come off before it is used as microseconds. */
+	qk_step_loss(tp, tp->srtt_us >> 3, lost, segments);
 
 	st = qk_get(tp);
 	if (st)
