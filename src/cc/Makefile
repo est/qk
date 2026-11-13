@@ -33,10 +33,11 @@ CTL       := $(BUILD_DIR)/qkctl
 
 # The BPF target architecture: x86_64 -> x86, aarch64 -> arm64, and so on.
 UNAME_M := $(shell uname -m)
-# The case statement has to stay on one line: make folds the backslash
-# continuations of a $(shell ...) into spaces before the shell sees them,
-# which would break the case.
-ARCH ?= $(shell case "$(UNAME_M)" in x86_64) echo x86 ;; aarch64|arm64) echo arm64 ;; armv7l|armv7) echo arm ;; ppc64le) echo powerpc ;; s390x) echo s390 ;; riscv64) echo riscv ;; *) echo "" ;; esac)
+# The mapping cannot be written as a shell case statement inside $(shell ...):
+# make counts the parentheses of a function call, and the closing parenthesis
+# of a case branch ends the call early, which leaves the shell with an
+# unbalanced expression. An if/else chain has no parentheses in it.
+ARCH ?= $(shell if [ "$(UNAME_M)" = "x86_64" ]; then echo x86; elif [ "$(UNAME_M)" = "aarch64" ] || [ "$(UNAME_M)" = "arm64" ]; then echo arm64; elif [ "$(UNAME_M)" = "armv7l" ] || [ "$(UNAME_M)" = "armv7" ]; then echo arm; elif [ "$(UNAME_M)" = "ppc64le" ]; then echo powerpc; elif [ "$(UNAME_M)" = "s390x" ]; then echo s390; elif [ "$(UNAME_M)" = "riscv64" ]; then echo riscv; else echo ""; fi)
 
 ifeq ($(strip $(ARCH)),)
 $(error unsupported architecture '$(UNAME_M)'; set ARCH= explicitly)
