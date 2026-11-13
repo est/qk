@@ -361,11 +361,13 @@ int BPF_PROG(qk_pkts_acked, struct tcp_sock *tp, const struct ack_sample *sample
 /*
  * One round of the control law.
  *
- * The three inputs are the round-trip time in microseconds, the number of
- * packets lost during the round, and the number that arrived. Where they come
- * from depends on the kernel's interface; see QK_ABI_ARGS.
+ * Both shapes of the kernel's interface hand the controller a rate sample;
+ * they differ only in whether the acknowledged-segment count and the flag
+ * word are passed alongside it. So the law reads the round-trip time, the
+ * loss count and the arrival count from the rate sample, and the shape of
+ * the callback does not change the law at all.
  */
-static void qk_step(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 acked)
+static void qk_step_loss(struct tcp_sock *tp, __u32 rtt_us, __u32 lost, __u32 acked)
 {
 	struct qk_state *st = qk_get(tp);
 	struct qk_tunables tun;
@@ -563,12 +565,47 @@ int BPF_PROG(qk_cong_avoid, struct tcp_sock *tp, __u32 ack, __u32 acked)
 		lost = tp->total_retrans - st->last_total_retrans;
 	segments = (__u32)(tp->bytes_acked / mss);
 
-	qk_step(tp, tp->srtt_us, lost, segments);
+	/* Without a rate sample the round-trip time comes from the socket's
+	 * own smoothed estimate. */
+	qk_step_loss(tp, tp->srtt_us, lost, segments);
 
 	st = qk_get(tp);
 	if (st)
 		st->last_total_retrans = tp->total_retrans;
 	return 0;
+}
+
+/* The law, driven by the rate sample the kernel hands over. */
+static void qk_step(struct tcp_sock *tp, const struct rate_sample *rs)
+{
+	__u32 lost, acked;
+
+	if (!rs)
+		return;
+	lost = rs->losses > 0 ? (__u32)rs->losses : 0;
+	acked = rs->acked_sacked;
+	qk_step_loss(tp, rs->rtt_us > 0 ? (__u32)rs->rtt_us : 0, lost, acked);
+}
+
+/*
+ * Record what the kernel last reported, so that the loader can show it: the
+ * rate sample's units differ between kernels, and seeing the raw values is
+ * the only way to tell what the controller is looking at.
+ */
+static void qk_record_sample(struct tcp_sock *tp, const struct rate_sample *rs)
+{
+	struct qk_state *st = qk_get(tp);
+
+	if (!st)
+		return;
+	st->last_delivered = rs->delivered;
+	st->last_interval_us = (__s32)rs->interval_us;
+	st->last_rtt_us = (__s32)rs->rtt_us;
+	st->last_app_limited = rs->is_app_limited;
+	st->last_losses = rs->losses;
+	st->last_acked = rs->acked_sacked;
+	st->last_new_round = st->new_round;
+	st->last_cwnd = tp->snd_cwnd;
 }
 
 #if QK_ABI_ARGS >= 4
@@ -580,67 +617,18 @@ int BPF_PROG(qk_cong_control, struct tcp_sock *tp, __u32 ack, int flag,
 	(void)ack;
 	(void)flag;
 
-	if (!rs)
-		return 0;
-
-	/* Record what the kernel last reported, so that the loader can show
-	 * it: the rate sample's units differ between kernels, and seeing the
-	 * raw values is the only way to tell what the controller is looking
-	 * at. */
-	{
-		struct qk_state *st = qk_get(tp);
-
-		if (st) {
-			st->last_delivered = rs->delivered;
-			st->last_interval_us = (__s32)rs->interval_us;
-			st->last_rtt_us = (__s32)rs->rtt_us;
-			st->last_app_limited = rs->is_app_limited;
-			st->last_losses = rs->losses;
-			st->last_acked = rs->acked_sacked;
-			st->last_new_round = st->new_round;
-			st->last_cwnd = tp->snd_cwnd;
-		}
-	}
-
-	qk_step(tp, rs->rtt_us > 0 ? (__u32)rs->rtt_us : 0,
-		rs->losses > 0 ? (__u32)rs->losses : 0, rs->acked_sacked);
+	qk_record_sample(tp, rs);
+	qk_step(tp, rs);
 	return 0;
 }
 
 #else /* QK_ABI_ARGS == 2 */
 
 SEC("struct_ops/qk_cong_control")
-int BPF_PROG(qk_cong_control, struct tcp_sock *tp, const struct ack_sample *sample)
+int BPF_PROG(qk_cong_control, struct tcp_sock *tp, const struct rate_sample *rs)
 {
-	struct qk_state *st;
-	struct qk_tunables tun;
-	__u32 lost = 0, acked, mss;
-
-	if (!sample)
-		return 0;
-
-	qk_load_tunables(&tun);
-	mss = tun.mss ? tun.mss : QK_DEFAULT_MSS;
-
-	st = qk_get(tp);
-	if (st) {
-		st->last_rtt_us = sample->rtt_us;
-		st->last_cwnd = tp->snd_cwnd;
-	}
-
-	/* This kernel's interface has no rate sample, so the erasure estimate
-	 * comes from the socket's own counters: the number of segments
-	 * retransmitted, against the number that were acknowledged. */
-	if (st && tp->total_retrans > st->last_total_retrans)
-		lost = tp->total_retrans - st->last_total_retrans;
-	acked = (__u32)(tp->bytes_acked / mss);
-
-	qk_step(tp, sample->rtt_us > 0 ? (__u32)sample->rtt_us : 0, lost, acked);
-
-	/* Remember the counters for the next round. */
-	st = qk_get(tp);
-	if (st)
-		st->last_total_retrans = tp->total_retrans;
+	qk_record_sample(tp, rs);
+	qk_step(tp, rs);
 	return 0;
 }
 
