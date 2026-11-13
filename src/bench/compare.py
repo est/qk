@@ -69,14 +69,16 @@ def main():
             rows.append((cc, int(r["bytes"]), float(r["elapsed"]),
                          float(r["mbit"])))
 
-    print("%-10s %-6s %12s %10s %10s" % ("cc", "run", "Mbit/s", "bytes", "elapsed"))
+    print("%-10s %-6s %12s %12s %10s" % ("cc", "run", "Mbit/s", "bytes", "elapsed"))
+    seen = {}
     for cc, b, el, mb in rows:
-        print("%-10s %-6d %12.2f %10d %10.2f" % (cc, 0, mb, b, el))
+        seen[cc] = seen.get(cc, 0) + 1
+        print("%-10s %-6d %12.2f %12d %10.2f" % (cc, seen[cc], mb, b, el))
 
     print()
     print("%-10s %6s %10s %10s %10s %10s"
           % ("cc", "runs", "mean", "min", "max", "stddev"))
-    for cc, _, _ in pairs:
+    for _, cc in pairs:
         vals = [r[3] for r in rows if r[0] == cc]
         if not vals:
             continue

@@ -19,10 +19,17 @@ driver can parse it:
 """
 
 import argparse
+import errno
 import socket
 import ssl
 import sys
 import time
+
+# TCP_CONGESTION is Linux only, and the constant is not exported by every
+# version of the socket module. The number is stable in the kernel's
+# headers (include/uapi/linux/tcp.h).
+TCP_CONGESTION = getattr(socket, "TCP_CONGESTION", 13)
+ENOPROTOOPT = getattr(errno, "ENOPROTOOPT", 92)
 
 
 def select_cc(sock, name):
@@ -37,9 +44,14 @@ def select_cc(sock, name):
     if not name or name == "default":
         return
     try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION,
-                        name.encode())
+        sock.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, name.encode())
     except OSError as exc:
+        if getattr(exc, "errno", None) in (ENOPROTOOPT, EINVAL) and not sys.platform.startswith("linux"):
+            # Not every platform has the option. When the peer selects the
+            # algorithm, this side does not need it.
+            print("rawtcp: this platform has no TCP_CONGESTION option, "
+                  "leaving the choice to the peer", file=sys.stderr)
+            return
         raise SystemExit("rawtcp: cannot select congestion control %r: %s"
                          % (name, exc))
 
