@@ -75,6 +75,12 @@ do_build() {
 	esac
 
 	cflags="-O2 -g -target bpf -D__TARGET_ARCH_$bpfarch -Wno-unused-parameter"
+	# A registered name cannot be replaced, so a changed controller is
+	# built under a new name to keep the old one loadable alongside it:
+	#     QK_CC_NAME=qk2 BUILD_DIR=... PIN_DIR=... remote-bench.sh build
+	if [ -n "${QK_CC_NAME:-}" ]; then
+		cflags="$cflags -DQK_CC_NAME=$QK_CC_NAME"
+	fi
 	inc="-I$REPO_DIR/src/cc -I/usr/include -I/usr/include/$(uname -m)-linux-gnu"
 
 	# The primary object works through cong_control and owns the pacing
