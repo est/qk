@@ -3,11 +3,13 @@
 # WHAT THIS BUILDS
 #   tcperf - a small TCP throughput probe that selects a congestion control
 #   per socket (setsockopt(TCP_CONGESTION)) and reports one machine readable
-#   RESULT line per run.
+#   RESULT line per run.  It has three modes: "client" writes to a peer,
+#   "reader" reads from a peer, and "server" accepts a connection.
 #
 # HOW TO BUILD
 #   Linux only (the source uses Linux UAPI headers):
 #       make
+#       make native
 #       make clean
 #
 #   On a non Linux host use the helper below, which builds inside the
@@ -28,7 +30,7 @@ LDFLAGS ?=
 BIN     := tcperf
 SRC     := tcperf.c
 
-.PHONY: all build clean docker-build
+.PHONY: all build clean docker-build native
 
 # On a Linux host the tool builds directly.  Elsewhere it is built inside a
 # container, because the source uses Linux UAPI headers.
@@ -40,6 +42,10 @@ endif
 
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Build on this machine, whatever the operating system: the source needs the
+# Linux uapi headers, so this only works where they are installed.
+native: $(BIN)
 
 clean:
 	rm -f $(BIN)

@@ -223,16 +223,17 @@ Mbit/s. FEC over three source addresses delivered 97.4 Mbit/s — about 1546
 times as much. Simply sending every symbol twice on two different addresses
 delivered 96.2 Mbit/s, and its residual loss matched the predicted p².
 
-**The kernel controller beats plain TCP on a lossy path.** `qk`, the
-erasure-aware controller in `src/cc`, was measured against cubic on the same
-40 % loss / 100 ms RTT path: **0.89 Mbit/s against 0.14 Mbit/s, a factor of
-6.4** (best run 1.51 Mbit/s, eleven times cubic). On a clean path it is
-about 7 % *slower* than cubic, because the delay bound is never reached there
-and the window grows to its ceiling. It is still 109 times behind the FEC
-transport, and the reason is not the control law: the kernel's own recovery
-machinery — the proportional window reduction during fast recovery, and the
-window reset on a retransmission timeout — is not reachable from a
-congestion-control callback. See `docs/qk-congestion-control.md`.
+**The kernel controller beats plain TCP on a lossy path, and loses badly to
+BBR.** `qk`, the erasure-aware controller in `src/cc`, was measured against
+cubic on the same 40 % loss / 100 ms RTT path: **0.89 Mbit/s against
+0.14 Mbit/s, a factor of 6.4**. On a real VPS with a 238 ms round-trip time
+the comparison against cubic (0.49 against 0.37 Mbit/s) flatters it: BBR
+reaches **49 Mbit/s** on that same path, and under 40 % injected loss every
+TCP congestion control — BBR included — falls to 0.03–0.07 Mbit/s, where an
+FEC transport still delivers 97 Mbit/s. The controller as it stands is
+window-based, and a window-only controller oscillates on a long path; BBR's
+advantage is rate-based control, which needs the kernel to let a congestion
+control write the socket's pacing rate. See `docs/qk-congestion-control.md`.
 
 **The transport has to live above IP.** A TCP connection is pinned to a
 four-tuple, so the receiver cannot acknowledge each source address
@@ -266,7 +267,7 @@ The same rules apply to anything added later.
 | research write-up | done, `docs/kernel-native-transport.md` |
 | congestion-control write-up | done, `docs/qk-congestion-control.md` |
 | `qkbtf`, `qkprobe` | done, built and checked against a live kernel |
-| `src/cc` congestion controller | works: registered with the kernel, 6.4x cubic on a lossy path, 7 % behind cubic on a clean one |
+| `src/cc` congestion controller | works: registered with the kernel on 5.15 and 7.x, 6.4x cubic on a lossy path, but far behind BBR on a long path — a rate-based rewrite is the next step |
 | `src/bench` comparison benchmark | works: per-socket controller selection, reproducible lossy lab |
 
 The open question the project is trying to answer is whether a real path

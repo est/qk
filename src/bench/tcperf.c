@@ -3,9 +3,14 @@
  *          control algorithms over a controlled (netem) path.
  *
  * WHAT IT DOES
- *   "tcperf server" accepts a connection and reads until EOF.
+ *   "tcperf server" accepts a connection and reads until EOF.  With --write
+ *   it first sends a fixed number of bytes to the peer (and then reads).
  *   "tcperf client" connects, streams data for a fixed duration and then
  *   shuts down its write side so the server observes EOF.
+ *   "tcperf reader" connects out to a remote endpoint and *reads* from it.
+ *   That is the mode a real path measurement needs: the peer sends, the
+ *   socket receives, and the congestion control of the receiving socket
+ *   decides how fast the data can arrive.
  *
  *   The client selects the congestion control *per socket* with
  *   setsockopt(IPPROTO_TCP, TCP_CONGESTION) before connect().  The requested
@@ -13,6 +18,9 @@
  *   /proc/sys/net/ipv4/tcp_available_congestion_control first; if it is not
  *   registered the tool fails loudly instead of silently falling back to the
  *   kernel default (a silent fallback would make the comparison meaningless).
+ *   The reader does the same, and additionally reads the algorithm back from
+ *   the connected socket: if the kernel quietly gave the socket a different
+ *   algorithm the run is aborted.
  *   Note that a non "reno"/"cubic" algorithm (e.g. a BPF registered one such
  *   as "qk") requires CAP_NET_ADMIN in the network namespace of the socket.
  *
@@ -26,13 +34,21 @@
  *                  [--write-size <bytes>] [--connect-timeout <s>]
  *                  [--so-sndbuf <bytes>] [--bind <ip>] [--quiet]
  *   tcperf server --bind <ip> --port <n> [--duration <s>]
- *                  [--so-rcvbuf <bytes>] [--accept <n>] [--quiet]
+ *                  [--so-rcvbuf <bytes>] [--accept <n>] [--write <bytes>]
+ *                  [--quiet]
+ *   tcperf reader --host <name-or-ip> --port <n> [--cc <name>]
+ *                  [--duration <s>] [--read-bytes <n>] [--connect-timeout <s>]
+ *                  [--so-rcvbuf <bytes>] [--bind <ip>] [--quiet]
  *
  * OUTPUT
  *   Exactly one machine readable summary line is printed on stdout:
  *
  *     RESULT role=client cc=cubic bytes=1234567 elapsed=12.34 mbit=8.21 \
  *            cwnd=42 ssthresh=100 rtt_us=200000 retrans=17 pacing=9000000
+ *
+ *   The reader prints the same line (role=client) with the counters of the
+ *   receiving socket; the server prints role=server and, in --write mode,
+ *   an additional sent=<bytes> field with the number of bytes it sent.
  *
  *   Human readable progress information goes to stderr (suppressed by
  *   --quiet).  Fields that the kernel does not provide are omitted, the
@@ -48,6 +64,7 @@
 #include <inttypes.h>
 #include <linux/tcp.h>
 #include <math.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -85,6 +102,9 @@
 /* The kernel may hand back more bytes than our headers know about; ask for
  * a buffer that is comfortably larger than any published struct tcp_info. */
 #define TCP_INFO_BUFSZ 512
+
+/* The kernel's limit for the name of a congestion control algorithm. */
+#define TCP_CA_NAME_MAX 16
 
 /* How long the server waits for further connections after the last one was
  * closed (only relevant when more than one connection is accepted). */
@@ -348,19 +368,51 @@ static int connect_with_timeout(int fd, const struct sockaddr *sa,
 }
 
 /* ------------------------------------------------------------------ */
+/* address resolution                                                  */
+/* ------------------------------------------------------------------ */
+
+/* Resolve a host name or an address literal into the list of addresses a
+ * connection may be made to.  The result belongs to the caller and has to be
+ * released with freeaddrinfo(). */
+static struct addrinfo *resolve_host(const char *host, int port)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    char portstr[16];
+    int rc;
+
+    snprintf(portstr, sizeof(portstr), "%d", port);
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    rc = getaddrinfo(host, portstr, &hints, &res);
+    if (rc != 0)
+        die("cannot resolve '%s': %s", host, gai_strerror(rc));
+    if (!res)
+        die("cannot resolve '%s': no addresses", host);
+    return res;
+}
+
+/* ------------------------------------------------------------------ */
 /* option parsing                                                      */
 /* ------------------------------------------------------------------ */
 
 struct options {
     const char *dst;
+    const char *host;
     const char *bind_addr;
     const char *cc;
     int port;
     double duration;
     double connect_timeout;
     size_t write_size;
+    uint64_t read_bytes;   /* reader: stop after this many bytes (0: no limit) */
+    uint64_t write_bytes;  /* server: send this many bytes (0: do not send) */
     long so_sndbuf;
     long so_rcvbuf;
+    bool so_rcvbuf_given;  /* the reader only caps the receive buffer on request */
     int accept_max;
 };
 
@@ -372,14 +424,24 @@ static void usage(FILE *out)
 "                [--write-size <bytes>] [--connect-timeout <s>]\n"
 "                [--so-sndbuf <bytes>] [--bind <ip>] [--quiet]\n"
 "  tcperf server --bind <ip> --port <n> [--duration <s>]\n"
-"                [--so-rcvbuf <bytes>] [--accept <n>] [--quiet]\n"
+"                [--so-rcvbuf <bytes>] [--accept <n>] [--write <bytes>]\n"
+"                [--quiet]\n"
+"  tcperf reader --host <name-or-ip> --port <n> [--cc <name>]\n"
+"                [--duration <s>] [--read-bytes <n>] [--connect-timeout <s>]\n"
+"                [--so-rcvbuf <bytes>] [--bind <ip>] [--quiet]\n"
 "\n"
 "options:\n"
 "  --cc <name>            congestion control to request for this socket; the\n"
 "                         name must appear in " TCP_CC_PROC "\n"
-"  --bind <ip>            optional local source address (client)\n"
+"  --bind <ip>            optional local source address (client, reader)\n"
+"  --host <name-or-ip>    remote endpoint to connect to (reader); a name is\n"
+"                         resolved with getaddrinfo()\n"
 "  --duration <s>         how long to transfer (default %.0f)\n"
 "  --write-size <bytes>   bytes per write() call (default %u)\n"
+"  --read-bytes <n>       stop reading after n bytes (reader; default: no\n"
+"                         limit, the duration decides)\n"
+"  --write <n>            send n bytes to the peer before reading it\n"
+"                         (server; default: do not send anything)\n"
 "  --connect-timeout <s>  connect timeout in seconds (default %.0f)\n"
 "  --so-sndbuf <bytes>    SO_SNDBUF (default %d)\n"
 "  --so-rcvbuf <bytes>    SO_RCVBUF (default %d)\n"
@@ -427,6 +489,20 @@ static long parse_long(const char *s, const char *what)
     if (errno != 0 || !end || *end != '\0' || v <= 0)
         die("invalid value for %s: '%s'", what, s);
     return v;
+}
+
+/* Parse a byte count.  Zero is allowed here (it means "no limit"), unlike
+ * in parse_long(). */
+static uint64_t parse_bytes(const char *s, const char *what)
+{
+    char *end = NULL;
+    unsigned long long v;
+
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno != 0 || !end || *end != '\0')
+        die("invalid value for %s: '%s'", what, s);
+    return (uint64_t)v;
 }
 
 /* ------------------------------------------------------------------ */
@@ -688,8 +764,277 @@ static int run_client(const struct options *o)
 }
 
 /* ------------------------------------------------------------------ */
+/* reader: connect out and read from the peer                          */
+/* ------------------------------------------------------------------ */
+
+/* The reader is the mirror image of the client: it connects *out* to a
+ * remote endpoint and reads what the peer sends.  That is what a real path
+ * measurement needs - the peer sends, the socket receives, and the
+ * congestion control of the receiving socket decides how fast the data can
+ * arrive.
+ *
+ * The congestion control is selected per socket, before the connection is
+ * established, and it is verified twice: the name has to be in the kernel's
+ * list of available algorithms, and the connected socket has to report the
+ * same name back.  A kernel that quietly gave the socket a different
+ * algorithm would make the comparison meaningless, so that is an error and
+ * not a warning.
+ */
+static int run_reader(const struct options *o)
+{
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai;
+    char *cclist = NULL;
+    char *ccname = NULL;
+    char sockcc[TCP_CA_NAME_MAX + 1];
+    int fd = -1;
+    uint64_t total = 0;
+    uint64_t limit = o->read_bytes;
+    double t0;
+    double elapsed;
+    double mbit;
+    struct tcp_info ti;
+    socklen_t tilen = 0;
+    bool have_info = false;
+    struct kv kv;
+    char rbuf[65536];
+
+    if (!o->host)
+        die("reader mode requires --host");
+    if (o->port <= 0 || o->port > 65535)
+        die("reader mode requires a valid --port");
+
+    /* --- sanity check the requested algorithm ------------------------ */
+    if (o->cc) {
+        cclist = read_cc_list();
+        if (cclist && !cc_in_list(cclist, o->cc)) {
+            fprintf(stderr, "tcperf: congestion control '%s' is not available in this network namespace.\n",
+                    o->cc);
+            fprintf(stderr, "tcperf: available: %s\n", cclist);
+            fprintf(stderr, "tcperf: (list read from %s)\n", TCP_CC_PROC);
+            free(cclist);
+            return 2;
+        }
+        if (!cclist)
+            note("warning: %s could not be read, relying on the socket check",
+                 TCP_CC_PROC);
+        else
+            note("congestion control '%s' is available", o->cc);
+        ccname = strdup(o->cc);
+        if (!ccname)
+            die("out of memory");
+    } else {
+        ccname = read_default_cc();
+        note("no --cc given, using the kernel default congestion control");
+        if (ccname)
+            note("default congestion control is '%s'", ccname);
+    }
+
+    res = resolve_host(o->host, o->port);
+
+    /* Every resolved address is tried in turn; the first one that connects
+     * wins. */
+    for (ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            note("socket: %s", strerror(errno));
+            fd = -1;
+            continue;
+        }
+
+        /* The receive buffer is left to the kernel's autotuning unless the
+         * user asked for a specific size: a small fixed receive buffer
+         * would cap the receive window, and the measurement would then be
+         * a measurement of the local buffer instead of the path. */
+        if (o->so_rcvbuf_given && o->so_rcvbuf > 0) {
+            int v = (int)o->so_rcvbuf;
+
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v)) < 0)
+                note("warning: SO_RCVBUF: %s", strerror(errno));
+        }
+
+        if (o->bind_addr) {
+            struct sockaddr_storage bss;
+            socklen_t blen = 0;
+
+            if (fill_addr(addr_family(o->bind_addr), o->bind_addr, 0, &bss, &blen) < 0)
+                die("invalid --bind address '%s'", o->bind_addr);
+            if (bind(fd, (struct sockaddr *)&bss, blen) < 0) {
+                note("bind(%s): %s", o->bind_addr, strerror(errno));
+                close(fd);
+                fd = -1;
+                continue;
+            }
+        }
+
+        /* Congestion control is selected per socket and must be set before
+         * the connection is established. */
+        if (o->cc) {
+            if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, o->cc,
+                           strlen(o->cc) + 1) < 0)
+                die("setsockopt(TCP_CONGESTION, \"%s\"): %s", o->cc,
+                    strerror(errno));
+        }
+
+        t0 = now_sec();
+        if (connect_with_timeout(fd, ai->ai_addr, ai->ai_addrlen,
+                                 o->connect_timeout) < 0) {
+            note("connect(%s:%d): %s", o->host, o->port, strerror(errno));
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        note("connected to %s:%d in %.3fs", o->host, o->port, now_sec() - t0);
+        break;
+    }
+
+    if (fd < 0)
+        die("cannot connect to %s:%d", o->host, o->port);
+    freeaddrinfo(res);
+    res = NULL;
+
+    /* --- the socket has to use the algorithm that was asked for ------- */
+    if (o->cc) {
+        socklen_t len = sizeof(sockcc);
+
+        memset(sockcc, 0, sizeof(sockcc));
+        if (getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, sockcc, &len) < 0)
+            die("getsockopt(TCP_CONGESTION): %s", strerror(errno));
+        sockcc[sizeof(sockcc) - 1] = '\0';
+        if (strcmp(sockcc, o->cc) != 0)
+            die("the socket uses congestion control '%s', not the requested '%s'",
+                sockcc, o->cc);
+        note("the socket uses congestion control '%s'", sockcc);
+    }
+
+    /* Non blocking, so that a stalled path cannot block the loop past the
+     * deadline. */
+    {
+        int flags = fcntl(fd, F_GETFL, 0);
+
+        if (flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+            note("warning: O_NONBLOCK: %s", strerror(errno));
+    }
+
+    /* --- read --------------------------------------------------------- */
+    t0 = now_sec();
+    {
+        double deadline = t0 + o->duration;
+
+        while (!g_stop) {
+            struct pollfd pfd;
+            ssize_t n;
+            double left;
+            int ms;
+
+            if (limit > 0 && total >= limit)
+                break;
+            if (now_sec() >= deadline)
+                break;
+
+            left = deadline - now_sec();
+            ms = (left > 0.2) ? 200 : (int)(left * 1000.0);
+
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, ms) < 0) {
+                if (errno == EINTR)
+                    continue;
+                die("poll: %s", strerror(errno));
+            }
+
+            n = read(fd, rbuf, sizeof(rbuf));
+            if (n > 0) {
+                total += (uint64_t)n;
+                if (limit > 0 && total >= limit) {
+                    /* The last read may overshoot the limit; report
+                     * exactly what was asked for. */
+                    if (total > limit)
+                        note("read %" PRIu64 " bytes past the limit, truncating",
+                             total - limit);
+                    total = limit;
+                }
+                continue;
+            }
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
+            if (n == 0) {
+                note("the peer closed the connection after %" PRIu64 " bytes",
+                     total);
+                break;
+            }
+            die("read: %s", strerror(errno));
+        }
+    }
+
+    elapsed = now_sec() - t0;
+    mbit = (elapsed > 0.0) ? ((double)total * 8.0 / elapsed / 1e6) : 0.0;
+
+    /* Collect the TCP_INFO counters before the socket goes away. */
+    memset(&ti, 0, sizeof(ti));
+    {
+        unsigned char raw[TCP_INFO_BUFSZ];
+
+        memset(raw, 0, sizeof(raw));
+        tilen = sizeof(raw);
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, raw, &tilen) == 0) {
+            size_t copy = (size_t)tilen;
+
+            if (copy > sizeof(ti))
+                copy = sizeof(ti);
+            memcpy(&ti, raw, copy);
+            have_info = true;
+        } else {
+            note("warning: getsockopt(TCP_INFO): %s", strerror(errno));
+        }
+    }
+
+    /* --- report ------------------------------------------------------- */
+    memset(&kv, 0, sizeof(kv));
+    kv_addf(&kv, "RESULT role=client");
+    if (ccname)
+        kv_addf(&kv, " cc=%s", ccname);
+    kv_addf(&kv, " bytes=%" PRIu64, total);
+    kv_addf(&kv, " elapsed=%.2f", elapsed);
+    kv_addf(&kv, " mbit=%.2f", mbit);
+    if (have_info) {
+        kv_addf(&kv, " cwnd=%u", ti.tcpi_snd_cwnd);
+        kv_addf(&kv, " ssthresh=%u", ti.tcpi_snd_ssthresh);
+        kv_addf(&kv, " rtt_us=%u", ti.tcpi_rtt);
+        kv_addf(&kv, " retrans=%u", ti.tcpi_total_retrans);
+        if (tilen >= (socklen_t)(offsetof(struct tcp_info, tcpi_pacing_rate) +
+                                 sizeof(ti.tcpi_pacing_rate)))
+            kv_addf(&kv, " pacing=%" PRIu64, ti.tcpi_pacing_rate);
+    }
+    fputs(kv.buf, stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+
+    note("read %" PRIu64 " bytes in %.2fs -> %.2f Mbit/s", total, elapsed, mbit);
+    if (have_info)
+        note("tcp_info: cwnd=%u ssthresh=%u rtt=%uus retrans=%u pacing=%" PRIu64 " B/s",
+             ti.tcpi_snd_cwnd, ti.tcpi_snd_ssthresh, ti.tcpi_rtt,
+             ti.tcpi_total_retrans, ti.tcpi_pacing_rate);
+
+    free(cclist);
+    free(ccname);
+    close(fd);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* server                                                              */
 /* ------------------------------------------------------------------ */
+
+/* One accepted connection. */
+struct conn {
+    int fd;
+    uint64_t to_send;   /* bytes still to be sent (--write mode) */
+    bool write_closed;  /* the write side of the socket was shut down */
+};
 
 static int run_server(const struct options *o)
 {
@@ -697,13 +1042,15 @@ static int run_server(const struct options *o)
     socklen_t slen = 0;
     int fd;
     uint64_t total = 0;
+    uint64_t sent = 0;
     double t0;
     double elapsed;
     double mbit;
     struct kv kv;
     char *buf = NULL;
+    char *wbuf = NULL;
     struct pollfd *pfds = NULL;
-    int *cfds = NULL;
+    struct conn *conns = NULL;
     int nconn = 0;
     int accept_max = (o->accept_max > 0) ? o->accept_max : 1;
 
@@ -736,13 +1083,20 @@ static int run_server(const struct options *o)
 
     note("listening on %s:%d (duration %.0fs, up to %d connection(s))",
          o->bind_addr, o->port, o->duration, accept_max);
+    if (o->write_bytes > 0)
+        note("sending %" PRIu64 " bytes to every accepted connection",
+             o->write_bytes);
 
     buf = malloc(65536);
     if (!buf)
         die("out of memory");
+    wbuf = malloc(65536);
+    if (!wbuf)
+        die("out of memory");
+    memset(wbuf, 'x', 65536);
     pfds = calloc((size_t)accept_max + 1, sizeof(*pfds));
-    cfds = calloc((size_t)accept_max, sizeof(*cfds));
-    if (!pfds || !cfds)
+    conns = calloc((size_t)accept_max, sizeof(*conns));
+    if (!pfds || !conns)
         die("out of memory");
 
     /* Accept and read at the same time: a connection that is already
@@ -774,8 +1128,10 @@ static int run_server(const struct options *o)
             pfds[0].revents = 0;
             nfd = 1;
             for (i = 0; i < nconn; i++) {
-                pfds[nfd].fd = cfds[i];
+                pfds[nfd].fd = conns[i].fd;
                 pfds[nfd].events = POLLIN;
+                if (conns[i].to_send > 0)
+                    pfds[nfd].events |= POLLOUT;
                 pfds[nfd].revents = 0;
                 nfd++;
             }
@@ -795,7 +1151,16 @@ static int run_server(const struct options *o)
                 int cfd = accept(fd, NULL, NULL);
 
                 if (cfd >= 0) {
-                    cfds[nconn] = cfd;
+                    int flags = fcntl(cfd, F_GETFL, 0);
+
+                    /* Non blocking, so that a peer that stops reading
+                     * cannot stall the accept loop. */
+                    if (flags >= 0)
+                        (void)fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
+
+                    conns[nconn].fd = cfd;
+                    conns[nconn].to_send = o->write_bytes;
+                    conns[nconn].write_closed = false;
                     nconn++;
                     open_conns++;
                     note("accepted connection %d/%d", nconn, accept_max);
@@ -806,11 +1171,46 @@ static int run_server(const struct options *o)
 
             /* data on the established connections? */
             for (i = 1; i < nfd; i++) {
+                struct conn *c = &conns[i - 1];
                 ssize_t n;
 
-                if (pfds[i].fd < 0 || pfds[i].revents == 0)
+                if (c->fd < 0 || pfds[i].revents == 0)
                     continue;
-                n = read(pfds[i].fd, buf, 65536);
+
+                /* --write mode: send the requested number of bytes */
+                if ((pfds[i].revents & POLLOUT) && c->to_send > 0) {
+                    while (c->to_send > 0) {
+                        size_t chunk = (c->to_send < 65536) ?
+                                       (size_t)c->to_send : 65536;
+
+                        n = write(c->fd, wbuf, chunk);
+                        if (n > 0) {
+                            c->to_send -= (uint64_t)n;
+                            sent += (uint64_t)n;
+                            continue;
+                        }
+                        if (n < 0 && errno == EINTR)
+                            continue;
+                        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                            break;
+                        if (n < 0)
+                            note("write: %s", strerror(errno));
+                        else
+                            note("write returned 0");
+                        break;
+                    }
+                    if (c->to_send == 0 && !c->write_closed) {
+                        /* the peer sees EOF once the data is consumed */
+                        if (shutdown(c->fd, SHUT_WR) < 0)
+                            note("warning: shutdown: %s", strerror(errno));
+                        c->write_closed = true;
+                    }
+                }
+
+                if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR)))
+                    continue;
+
+                n = read(c->fd, buf, 65536);
                 if (n > 0) {
                     total += (uint64_t)n;
                     continue;
@@ -821,8 +1221,8 @@ static int run_server(const struct options *o)
                     continue;
                 if (n < 0)
                     note("read: %s", strerror(errno));
-                close(pfds[i].fd);
-                pfds[i].fd = -1;
+                close(c->fd);
+                c->fd = -1;
                 open_conns--;
                 last_close = now_sec();
             }
@@ -830,8 +1230,8 @@ static int run_server(const struct options *o)
         elapsed = now_sec() - t0;
 
         for (i = 0; i < nconn; i++) {
-            if (pfds[i + 1].fd >= 0)
-                close(pfds[i + 1].fd);
+            if (conns[i].fd >= 0)
+                close(conns[i].fd);
         }
     }
 
@@ -845,15 +1245,20 @@ static int run_server(const struct options *o)
     kv_addf(&kv, " bytes=%" PRIu64, total);
     kv_addf(&kv, " elapsed=%.2f", elapsed);
     kv_addf(&kv, " mbit=%.2f", mbit);
+    if (o->write_bytes > 0)
+        kv_addf(&kv, " sent=%" PRIu64, sent);
     fputs(kv.buf, stdout);
     fputc('\n', stdout);
     fflush(stdout);
 
     note("read %" PRIu64 " bytes in %.2fs -> %.2f Mbit/s", total, elapsed, mbit);
+    if (o->write_bytes > 0)
+        note("sent %" PRIu64 " bytes", sent);
 
     free(buf);
+    free(wbuf);
     free(pfds);
-    free(cfds);
+    free(conns);
     close(fd);
     return 0;
 }
@@ -877,8 +1282,10 @@ int main(int argc, char **argv)
         usage(stdout);
         return 0;
     }
-    if (!arg_is(mode, "client") && !arg_is(mode, "server")) {
-        fprintf(stderr, "tcperf: unknown mode '%s' (expected 'client' or 'server')\n", mode);
+    if (!arg_is(mode, "client") && !arg_is(mode, "server") &&
+        !arg_is(mode, "reader") && !arg_is(mode, "read")) {
+        fprintf(stderr, "tcperf: unknown mode '%s' "
+                "(expected 'client', 'reader' or 'server')\n", mode);
         usage(stderr);
         return 2;
     }
@@ -914,6 +1321,9 @@ int main(int argc, char **argv)
         } else if (arg_is(arg, "--dst")) {
             if (!val) val = next_value(argc, argv, &i, "--dst");
             o.dst = val;
+        } else if (arg_is(arg, "--host")) {
+            if (!val) val = next_value(argc, argv, &i, "--host");
+            o.host = val;
         } else if (arg_is(arg, "--bind")) {
             if (!val) val = next_value(argc, argv, &i, "--bind");
             o.bind_addr = val;
@@ -929,6 +1339,12 @@ int main(int argc, char **argv)
         } else if (arg_is(arg, "--write-size")) {
             if (!val) val = next_value(argc, argv, &i, "--write-size");
             o.write_size = (size_t)parse_long(val, "--write-size");
+        } else if (arg_is(arg, "--read-bytes")) {
+            if (!val) val = next_value(argc, argv, &i, "--read-bytes");
+            o.read_bytes = parse_bytes(val, "--read-bytes");
+        } else if (arg_is(arg, "--write")) {
+            if (!val) val = next_value(argc, argv, &i, "--write");
+            o.write_bytes = parse_bytes(val, "--write");
         } else if (arg_is(arg, "--connect-timeout")) {
             if (!val) val = next_value(argc, argv, &i, "--connect-timeout");
             o.connect_timeout = parse_double(val, "--connect-timeout");
@@ -938,6 +1354,7 @@ int main(int argc, char **argv)
         } else if (arg_is(arg, "--so-rcvbuf")) {
             if (!val) val = next_value(argc, argv, &i, "--so-rcvbuf");
             o.so_rcvbuf = parse_long(val, "--so-rcvbuf");
+            o.so_rcvbuf_given = true;
         } else if (arg_is(arg, "--accept")) {
             if (!val) val = next_value(argc, argv, &i, "--accept");
             o.accept_max = (int)parse_long(val, "--accept");
@@ -957,5 +1374,7 @@ int main(int argc, char **argv)
 
     if (arg_is(mode, "client"))
         return run_client(&o);
+    if (arg_is(mode, "reader") || arg_is(mode, "read"))
+        return run_reader(&o);
     return run_server(&o);
 }
