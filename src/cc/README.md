@@ -22,6 +22,17 @@ differently:
 The design and the measurements behind it are in
 [`docs/qk-congestion-control.md`](../../docs/qk-congestion-control.md).
 
+## Terms used here
+
+| Term | In one line |
+| --- | --- |
+| BPF / eBPF | Small programs that run inside the kernel. |
+| `BPF_PROG_TYPE_STRUCT_OPS` | The BPF program type for filling one of the kernel's pluggable callback tables. |
+| congestion control | The TCP stack's rules for how fast to send. |
+| pacing rate | The rate the kernel sends at. |
+| sending window | The unacknowledged bytes allowed in flight. |
+| `setsockopt(TCP_CONGESTION, ...)` | How a socket asks for a particular congestion control, as opposed to setting it for the whole machine. |
+
 ## Layout
 
 | file | what it is |

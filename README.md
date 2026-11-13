@@ -17,6 +17,59 @@ production ready.
 
 ---
 
+## Terms
+
+Short definitions for everything the documents use. Read the documents in
+order; anything unfamiliar will be here.
+
+### Protocols and networking
+
+| Term | In one line |
+| --- | --- |
+| TCP | The kernel's reliable, ordered byte stream. Its congestion control decides how fast it may send. |
+| UDP | Connectionless, no delivery guarantee. The carrier for the FEC transport. |
+| RTT | Round-trip time: how long a packet takes to go out and come back. |
+| BDP | Bandwidth-delay product = bandwidth x RTT: how many bytes fit in one round trip. |
+| cwnd | Congestion window: the cap on unacknowledged bytes in flight. |
+| PRR | Proportional rate reduction: how the kernel shrinks the window during fast recovery. |
+| pacing | Sending at a set rate instead of as fast as the queue allows. |
+| four-tuple | Source and destination address and port. It is what pins a TCP connection to one path. |
+| NAT / CGNAT | Network address translation, and the carrier-grade version of it. A client behind one can only dial out. |
+| FEC | Forward error correction: send extra "repair symbols" so the receiver can fill the gaps without waiting for a retransmission. |
+| ARQ | Automatic repeat request: recover loss by retransmitting after feedback. |
+| BBR | The kernel's rate-based congestion control; it controls the rate rather than the window. |
+| cubic | The kernel's default window-based congestion control. |
+| AEAD | Encryption with authentication: confidentiality and integrity together. |
+
+### Kernel and eBPF
+
+| Term | In one line |
+| --- | --- |
+| BPF / eBPF | Berkeley Packet Filter and its extensions: small programs that run inside the kernel. |
+| BTF | The kernel's type description: every struct's fields, types and offsets. |
+| CO-RE | Compile once, run everywhere: field accesses are resolved against BTF at load time, so one binary works across kernel versions. |
+| struct_ops | The kernel's table of pluggable callbacks. A BPF program fills it and the kernel calls it. |
+| congestion control | The TCP stack's rules for how fast to send. |
+| reno / cubic / BBR | The three congestion controls Linux ships: reno is the old one, cubic is the default, BBR controls the rate rather than the window. |
+| slow start / fast recovery / fast retransmit | The three phases of TCP: the window grows exponentially in slow start, a loss starts fast recovery, and duplicate acknowledgements trigger fast retransmit. |
+| socket / setsockopt | A socket is one endpoint of a connection inside the kernel; setsockopt sets an option on it, such as which congestion control it should use. |
+| kfunc | A kernel function exported so that BPF programs can call it. |
+| netem | The kernel's network emulator: delay, jitter, loss and rate limits. |
+| qdisc | Queueing discipline, the kernel's traffic-shaping layer. |
+| flower | A classifier that matches on packet fields such as source address. |
+| tc | Traffic control: the layer where programs are attached to a network device. |
+| XDP | The earliest hook, on the network device driver itself. |
+| LRU | Least recently used; one kind of BPF map, which evicts cold entries on its own. |
+| ABI | The binary interface: the agreed shape of the functions on either side of a call. |
+
+### Measuring
+
+| Term | In one line |
+| --- | --- |
+| VPS | A rented remote machine. |
+| open-loop probe | A measurement that sets its own send rate instead of waiting for feedback; waiting for feedback measures the reaction of TCP rather than the path. |
+| per-socket | Selected on one socket, as opposed to globally for the machine. |
+
 ## What's here
 
 ```
@@ -27,6 +80,7 @@ docs/
   qk-congestion-control.md      the congestion controller: the design, the
                                 measurements against plain TCP, and the ceiling
                                 it runs into
+  transport/                    (in src) the FEC transport prototype
 
 src/
   cc/                           the BPF congestion controller (BPF_PROG_TYPE_
@@ -35,10 +89,20 @@ src/
   bench/                        the comparison benchmark: the kernel controller
                                 against a plain TCP baseline
   tools/                        measurement and inspection tools (see below)
+  transport/                    the FEC transport prototype: the layer the
+                                congestion control cannot replace
 
 Makefile                        thin wrapper that delegates to the three
                                 subprojects
 ```
+
+**Where to start.** The two documents under `docs/` are in Chinese and are
+written to be read in order; each opens with a glossary of every term it
+uses. If you are taking this over, read `kernel-native-transport.md` first
+(it explains the problem and what the kernel can do), then
+`qk-congestion-control.md` (what was built and measured), then the code.
+
+If you only want the short version, it is in "Measured findings" below.
 
 `src/tools` holds two programs:
 
@@ -46,6 +110,12 @@ Makefile                        thin wrapper that delegates to the three
 | --- | --- |
 | `qkbtf` | inspects the running kernel's BTF: find types, dump a struct as a C definition, list a struct's fields, show a function's prototype, report a type's size. It exists because `bpftool` is not installed. |
 | `qkprobe` | an open-loop UDP probe: sends numbered datagrams at a fixed rate and measures per-source-address loss and delivery rate. |
+
+`src/transport` holds the FEC transport prototype: it sends the data as
+symbols over unreliable datagrams and repairs the erasures with forward error
+correction, so a loss does not turn into a stall. It is a prototype for
+measuring what such a transport is worth; it has no authentication and no
+congestion control of its own.
 
 The upstream Queqiao checkout and the scratch directory are **not** part of
 this repository; see `.gitignore`.

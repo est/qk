@@ -2,6 +2,16 @@
 
 Getting `qk` onto a machine and measuring it.
 
+## Terms used here
+
+| Term | In one line |
+| --- | --- |
+| BPF / eBPF | Small programs that run inside the kernel. |
+| BTF | The kernel's type description: every struct's fields, types and offsets. |
+| congestion control | The TCP stack's rules for how fast to send. |
+| pacing rate | The rate the kernel sends at, as opposed to sending as fast as the queue allows. |
+| sending window | The unacknowledged bytes allowed in flight. |
+
 ## What has to be there
 
 | requirement | how to check |
