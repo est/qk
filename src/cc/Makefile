@@ -47,6 +47,9 @@ ifeq ($(strip $(ARCH)),)
 $(error unsupported architecture '$(UNAME_M)'; set ARCH= explicitly)
 endif
 
+# The fallback when the kernel's interface cannot be read: the newer shape.
+ABI_ARGS ?= 4
+
 # The BPF_CFLAGS are assembled here but the ABI is only known inside the
 # container, where the helper is built and run.
 BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) \
