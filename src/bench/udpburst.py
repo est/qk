@@ -25,7 +25,7 @@ import socket
 import struct
 import time
 
-HDR = struct.Struct("!QII")  # seq, send_ts_ms, pad
+HDR = struct.Struct("!QQI")  # seq, send_ts_ms, pad
 
 
 def now_ms():
@@ -79,7 +79,7 @@ def _paced_send(s, dst, pps, size, dur, label):
 def tx(args):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("0.0.0.0", 0))
-    _paced_send(s, parse_addr(args.addr), args.pps, args.size, args.dur, "tx")
+    _paced_send(s, args.addr, args.pps, args.size, args.dur, "tx")
 
 
 def rx(args):
@@ -87,8 +87,8 @@ def rx(args):
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", args.port))
     if args.kick:
-        s.sendto(b"K", parse_addr(args.kick))
-        print("rx: kicked %s" % (args.kick,), flush=True)
+        s.sendto(b"K", args.kick)
+        print("rx: kicked %s:%d" % args.kick, flush=True)
 
     # Wait for the first packet, then run the window from there; the
     # sender's burst may start a one-way delay after the kick.
@@ -104,6 +104,8 @@ def rx(args):
     count = 1
     nbytes = len(first)
     first_seq = last_seq = 0
+    if len(first) >= HDR.size:
+        first_seq = last_seq = HDR.unpack(first[:HDR.size])[0]
     deadline = time.monotonic() + args.dur + 1.0  # 1s grace for the tail
     while time.monotonic() < deadline:
         try:
@@ -115,14 +117,11 @@ def rx(args):
         count += 1
         nbytes += len(data)
         if len(data) >= HDR.size:
-            seq, _, _ = HDR.unpack(data[:HDR.size])
-            if count == 2:
-                first_seq = seq
-            last_seq = seq
+            last_seq = HDR.unpack(data[:HDR.size])[0]
     print("RESULT role=rx received=%d bytes=%d first_seq=%d last_seq=%d "
           "missing=%d"
           % (count, nbytes, first_seq, last_seq,
-             (last_seq - first_seq + 1) - (count - 1) if count > 1 else 0),
+             (last_seq - first_seq + 1) - count),
           flush=True)
 
 

@@ -590,8 +590,20 @@ static int cmd_load(const char *object, const char *fallback, const char *pin_di
 			die("fork: %s", strerror(errno));
 		if (pid == 0) {
 			struct sigaction sa = { 0 };
+			int devnull;
 
 			close(pipefd[0]);
+			/* The daemon has nothing to say, and holding the
+			 * caller's stdout would keep a pipe open: a plain
+			 * "qkctl load --daemon | tail" would never see the
+			 * end of its input. */
+			devnull = open("/dev/null", O_RDWR);
+			if (devnull >= 0) {
+				dup2(devnull, STDOUT_FILENO);
+				dup2(devnull, STDERR_FILENO);
+				if (devnull > STDERR_FILENO)
+					close(devnull);
+			}
 			sa.sa_handler = on_signal;
 			sigaction(SIGTERM, &sa, NULL);
 			sigaction(SIGINT, &sa, NULL);
