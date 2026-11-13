@@ -173,19 +173,65 @@ static void pace(void)
 	g_next += 1.0 / g_pps;
 }
 
+/*
+ * An endpoint that may be either address family.
+ *
+ * The family follows the address: a literal with a colon is IPv6, anything
+ * else is IPv4. Parsing an address of the wrong family fails quietly and
+ * leaves the address zeroed, which sends the traffic nowhere, so the family
+ * is decided here rather than at each call site.
+ */
+struct endpoint {
+	int family;
+	union {
+		struct sockaddr_in v4;
+		struct sockaddr_in6 v6;
+	} sa;
+};
+
+static int parse_endpoint(struct endpoint *ep, const char *addr, int port)
+{
+	memset(ep, 0, sizeof(*ep));
+	if (strchr(addr, ':')) {
+		ep->family = AF_INET6;
+		ep->sa.v6.sin6_family = AF_INET6;
+		ep->sa.v6.sin6_port = htons(port);
+		if (inet_pton(AF_INET6, addr, &ep->sa.v6.sin6_addr) != 1) {
+			fprintf(stderr, "qkfec: cannot parse IPv6 address %s\n", addr);
+			return -1;
+		}
+		return 0;
+	}
+	ep->family = AF_INET;
+	ep->sa.v4.sin_family = AF_INET;
+	ep->sa.v4.sin_port = htons(port);
+	if (inet_pton(AF_INET, addr, &ep->sa.v4.sin_addr) != 1) {
+		fprintf(stderr, "qkfec: cannot parse IPv4 address %s\n", addr);
+		return -1;
+	}
+	return 0;
+}
+
+static socklen_t endpoint_len(const struct endpoint *ep)
+{
+	return ep->family == AF_INET6 ? sizeof(ep->sa.v6) : sizeof(ep->sa.v4);
+}
+
 static int mkchan(const char *src, const char *dst, int port)
 {
-	int fd = socket(AF_INET6, SOCK_DGRAM, 0);
-	int sb = 8 << 20;
+	struct endpoint d, l;
+	int fd, sb = 8 << 20;
+
+	if (parse_endpoint(&d, dst, port) < 0)
+		exit(1);
+	if (parse_endpoint(&l, src, port) < 0)
+		exit(1);
+
+	fd = socket(d.family, SOCK_DGRAM, 0);
+	if (fd < 0) { perror("socket"); exit(1); }
 	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof(sb));
-	struct sockaddr_in6 d = {0}, l = {0};
-	d.sin6_family = AF_INET6;
-	d.sin6_port = htons(port);
-	inet_pton(AF_INET6, dst, &d.sin6_addr);
-	l.sin6_family = AF_INET6;
-	inet_pton(AF_INET6, src, &l.sin6_addr);
-	if (bind(fd, (void *)&l, sizeof(l)) < 0) { perror("bind src"); exit(1); }
-	if (connect(fd, (void *)&d, sizeof(d)) < 0) { perror("connect"); exit(1); }
+	if (bind(fd, (void *)&l.sa, endpoint_len(&l)) < 0) { perror("bind src"); exit(1); }
+	if (connect(fd, (void *)&d.sa, endpoint_len(&d)) < 0) { perror("connect"); exit(1); }
 	return fd;
 }
 
@@ -210,6 +256,7 @@ int main(int argc, char **argv)
 		int fd[MAXCH];
 		for (int i = 0; i < nch; i++)
 			fd[i] = mkchan(srcs[i], dstip, port);
+
 
 		int in = strcmp(infile, "-") ? open(infile, O_RDONLY) : 0;
 		if (in < 0) { perror("open in"); return 1; }
@@ -311,16 +358,16 @@ int main(int argc, char **argv)
 		const char *outfile = argv[4];
 		double dur = atof(argv[5]);
 
-		int s = socket(AF_INET6, SOCK_DGRAM, 0);
-		int one = 1;
+		struct endpoint bind_ep;
+		int s, one = 1, rb = 32 << 20;
+
+		if (parse_endpoint(&bind_ep, bindip, port) < 0)
+			return 1;
+		s = socket(bind_ep.family, SOCK_DGRAM, 0);
+		if (s < 0) { perror("socket"); return 1; }
 		setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-		int rb = 32 << 20;
 		setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
-		struct sockaddr_in6 la = {0};
-		la.sin6_family = AF_INET6;
-		la.sin6_port = htons(port);
-		inet_pton(AF_INET6, bindip, &la.sin6_addr);
-		if (bind(s, (void *)&la, sizeof(la)) < 0) { perror("bind"); return 1; }
+		if (bind(s, (void *)&bind_ep.sa, endpoint_len(&bind_ep)) < 0) { perror("bind"); return 1; }
 
 		int out = strcmp(outfile, "-") ? open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644) : 1;
 		if (out < 0) { perror("open out"); return 1; }
