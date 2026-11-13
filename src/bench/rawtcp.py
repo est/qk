@@ -57,6 +57,11 @@ def select_cc(sock, name):
                          % (name, exc))
 
 
+def address_family(host):
+    """AF_INET6 for a literal IPv6 address, AF_INET otherwise."""
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -72,7 +77,7 @@ def main():
                     help="connect and read timeout, in seconds")
     args = ap.parse_args()
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = socket.socket(address_family(args.host), socket.SOCK_STREAM)
     sock.settimeout(args.timeout)
     select_cc(sock, args.cc)
 

@@ -35,6 +35,15 @@ def select_cc(conn, name):
               file=sys.stderr, flush=True)
 
 
+def address_family(host):
+    """AF_INET6 for a literal IPv6 address, AF_INET otherwise.
+
+    The tool takes a literal address on purpose; nothing here resolves
+    names, so the family is decided by the shape of the address.
+    """
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
 def handle(conn, cc, total, path):
     select_cc(conn, cc)
     header = ("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n"
@@ -73,7 +82,7 @@ def main():
     ap.add_argument("--bind", default="0.0.0.0")
     args = ap.parse_args()
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv = socket.socket(address_family(args.bind), socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((args.bind, args.port))
     srv.listen(16)

@@ -14,6 +14,12 @@ back at the address that datagram came from.
   python3 udpburst.py rx --port 9999 --dur 12
   python3 udpburst.py tx --addr <vps>:9999 --pps 5000 --size 1200 --dur 10
 
+IPv6 usually has no NAT, so the receiver just binds and the sender aims
+at the address directly (add --v6 to the receiver):
+
+  python3 udpburst.py rx --port 9999 --v6 --dur 12
+  python3 udpburst.py tx --addr [2607:...]:9999 --pps 5000 --size 1200 --dur 10
+
 Both ends print one RESULT line; compare sent against received to get
 the loss, and bytes against the duration to get the delivered rate.
 The receiver anchors its deadline to the first packet so a kick in
@@ -34,9 +40,23 @@ def now_ms():
 
 def parse_addr(s):
     host, _, port = s.rpartition(":")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
     if not host or not port.isdigit():
         raise argparse.ArgumentTypeError("expected ip:port, got %r" % s)
     return host, int(port)
+
+
+def address_family(host):
+    """AF_INET6 for a literal IPv6 address, AF_INET otherwise."""
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
+def _bind_any(s, port):
+    if s.family == socket.AF_INET6:
+        s.bind(("::", port))
+    else:
+        s.bind(("0.0.0.0", port))
 
 
 def _paced_send(s, dst, pps, size, dur, label):
@@ -77,15 +97,16 @@ def _paced_send(s, dst, pps, size, dur, label):
 
 
 def tx(args):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("0.0.0.0", 0))
+    s = socket.socket(address_family(args.addr[0]), socket.SOCK_DGRAM)
+    _bind_any(s, 0)
     _paced_send(s, args.addr, args.pps, args.size, args.dur, "tx")
 
 
 def rx(args):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(socket.AF_INET6 if args.v6 else socket.AF_INET,
+                      socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", args.port))
+    _bind_any(s, args.port)
     if args.kick:
         s.sendto(b"K", args.kick)
         print("rx: kicked %s:%d" % args.kick, flush=True)
@@ -127,9 +148,10 @@ def rx(args):
 
 def burst(args):
     """Wait for a kick, then burst back at whoever kicked us."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(socket.AF_INET6 if args.v6 else socket.AF_INET,
+                      socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", args.port))
+    _bind_any(s, args.port)
     s.settimeout(args.wait)
     try:
         _, addr = s.recvfrom(65535)
@@ -154,6 +176,8 @@ def main():
     p.add_argument("--port", type=int, default=9999)
     p.add_argument("--dur", type=float, default=12.0)
     p.add_argument("--wait", type=float, default=15.0)
+    p.add_argument("--v6", action="store_true",
+                   help="bind IPv6 instead of IPv4")
     p.add_argument("--kick", type=parse_addr,
                    help="ip:port of the sender to kick first")
 
@@ -163,6 +187,8 @@ def main():
     p.add_argument("--size", type=int, default=1200)
     p.add_argument("--dur", type=float, default=10.0)
     p.add_argument("--wait", type=float, default=15.0)
+    p.add_argument("--v6", action="store_true",
+                   help="bind IPv6 instead of IPv4")
 
     args = ap.parse_args()
     {"tx": tx, "rx": rx, "burst": burst}[args.mode](args)
