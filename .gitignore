@@ -93,3 +93,7 @@ desktop.ini
 .env
 .env.*
 secrets.*
+
+# --- built binaries -------------------------------------------------
+/src/transport/qkfec
+/src/bench/tcperf

@@ -220,7 +220,6 @@ int main(int argc, char **argv)
 		uint32_t gsym = 0;       /* symbol index (grouping)  */
 		uint64_t nsym = 0, nrep = 0, bytes = 0, ndat = 0;
 		double t0 = now();
-		double next = t0;
 		g_next = t0;
 		g_pps = pps;
 
@@ -295,9 +294,10 @@ int main(int argc, char **argv)
 		}
 		double el = now() - t0;
 		fprintf(stderr,
-			"SEND mode=%s symbols=%llu datagrams=%llu payload=%llu elapsed=%.2f "
+			"SEND mode=%s symbols=%llu repairs=%llu datagrams=%llu payload=%llu elapsed=%.2f "
 			"wire_Mbit=%.2f payload_Mbit=%.2f overhead=%.1f%%\n",
-			mode, (unsigned long long)nsym, (unsigned long long)ndat,
+			mode, (unsigned long long)nsym, (unsigned long long)nrep,
+			(unsigned long long)ndat,
 			(unsigned long long)bytes, el,
 			ndat * (HDRSZ + SYMSZ) * 8 / el / 1e6,
 			bytes * 8 / el / 1e6,
@@ -330,7 +330,7 @@ int main(int argc, char **argv)
 		unsigned char *grpready = calloc(4096, 1);
 		unsigned char *slots = calloc(NRING, 1);
 		unsigned char (*slotval)[SYMSZ] = calloc(NRING, sizeof(*slotval));
-		uint32_t next_group = 0, next_seq = 0, highest = 0;
+		uint32_t next_seq = 0, highest = 0;
 		uint64_t lost = 0;
 		uint64_t got = 0, outbytes = 0, nsym_out = 0, nsolved = 0;
 
